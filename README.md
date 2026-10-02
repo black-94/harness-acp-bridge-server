@@ -1,4 +1,4 @@
-# harness-acp-bridge-server
+# @black942026/harness-acp-bridge-server
 
 Bridge an ACP harness (CodeBuddy / Codex / any ACP agent) to an MCP client through an
 asynchronous, per-session message loop.
@@ -36,14 +36,31 @@ The daemon is auto-started by the MCP client on the first call that needs it (de
 socket and lock from the configuration). A PID lock file plus the socket bind make it a
 singleton; a second daemon on the same lock exits with an error.
 
-## Install / build
+## Install
+
+Requires **Node.js >= 20.11** on **macOS or Linux**. Windows is not supported.
+Install the ACP harness you plan to use separately and make its command available on `PATH`
+(or configure an absolute command path). Docker and SSH are optional, needed only for their
+respective launch modes. This package does not bundle harnesses or credentials.
 
 ```bash
-npm install
-npm run build      # tsc -> dist/
-npm run typecheck
-npm test           # 152 tests: unit + mock-harness/mock-CLI e2e + MCP stdio e2e
+npm install -g @black942026/harness-acp-bridge-server
+harness-acp-bridge --config /abs/path/to/config.yaml
 ```
+
+The package includes prebuilt JavaScript and `config.example.yaml`; no TypeScript build is
+needed after installing from npm. Copy the example config from the installed package
+(`$(npm root -g)/@black942026/harness-acp-bridge-server/config.example.yaml`) and adjust it for
+your harnesses and models. `--config` is optional (see [Configuration](#configuration)).
+
+## Development / build
+
+```bash
+npm ci
+npm run check      # clean build + typecheck + unit/mock-CLI/MCP stdio e2e tests
+```
+
+This is a CLI/MCP server package, not a supported JavaScript library API.
 
 The e2e suite runs a real daemon and a real MCP stdio client against a fake ACP harness, and
 drives **mock `docker` and `ssh` CLIs** (`test/fixtures/mock-docker.mjs`,
@@ -52,8 +69,26 @@ policy, and pid-file handling are exercised without touching a real engine or ho
 
 ## Running the MCP server (stdio)
 
-`dist/cli.js` is a standard **stdio** MCP server: it speaks newline-delimited JSON-RPC on
-stdin/stdout. Point an MCP client at the Node command directly:
+The CLI is a standard **stdio** MCP server: it speaks newline-delimited JSON-RPC on
+stdin/stdout. Run it without a global installation using an explicit package and binary
+(the package provides two binaries, so do not rely on npx's binary inference):
+
+```jsonc
+{
+  "mcpServers": {
+    "harness-acp-bridge": {
+      "command": "npx",
+      "args": ["--yes", "--package=@black942026/harness-acp-bridge-server", "harness-acp-bridge", "--config", "/abs/path/to/config.yaml"]
+    }
+  }
+}
+```
+
+For reproducible deployments, pin the package spec to a published version, for example
+`--package=@black942026/harness-acp-bridge-server@0.1.0`. With a global installation, use
+`"command": "harness-acp-bridge"` and `"args": ["--config", "/abs/path/to/config.yaml"]`.
+
+For a source checkout, point an MCP client at the built Node entrypoint directly:
 
 ```jsonc
 {
@@ -500,6 +535,29 @@ the directory that call created.
 - The authentication attempt ledger holds only SHA-256 target hashes and timestamps, is
   written atomically (temp file + `rename`) with mode `0600`, and is serialized within the
   single writer daemon.
+
+## Publishing (maintainers)
+
+```bash
+npm ci
+npm run check
+npm pack --dry-run              # review the file list; prepack rebuilds dist/
+npm audit --omit=dev
+npm login --registry=https://registry.npmjs.org/
+npm whoami --registry=https://registry.npmjs.org/   # account must own the @black942026 scope
+npm publish --access public     # prepublishOnly runs check; prepack rebuilds dist/
+```
+
+Review the tarball before publishing: it should contain only `dist/`, `package.json`,
+`config.example.yaml`, `README.md`, and `LICENSE`. Never include local configs, credentials,
+session state, or `node_modules/`. Publishing requires the scope's permissions and npm's
+current authentication/2FA requirements. The default version is `0.1.0`, a non-prerelease
+version; choose `1.0.0` only when you intend to commit to a stable compatibility contract.
+For later releases, use `npm version patch|minor|major` from a clean working tree to update
+both manifests; MCP/ACP handshake versions follow `package.json` automatically. Run the
+checks again for the new version, push the commit/tag, then publish. Never reuse a published
+version. GitHub Actions CI on Linux/macOS and a real harness smoke test are recommended
+before the first release (the e2e suite below uses mocks).
 
 ## Not implemented (honest limitations)
 

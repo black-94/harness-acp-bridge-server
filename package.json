@@ -1,10 +1,23 @@
 {
-  "name": "harness-acp-bridge-server",
+  "name": "@black942026/harness-acp-bridge-server",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "Bridge ACP harnesses (codebuddy/agy/codex) to an MCP client with an asynchronous per-session message queue.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/black-94/harness-acp-bridge-server.git"
+  },
+  "homepage": "https://github.com/black-94/harness-acp-bridge-server#readme",
+  "bugs": {
+    "url": "https://github.com/black-94/harness-acp-bridge-server/issues"
+  },
+  "keywords": ["acp", "mcp", "harness", "bridge", "codebuddy", "codex"],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "os": ["darwin", "linux"],
   "engines": {
     "node": ">=20.11"
   },
@@ -15,14 +28,18 @@
   "files": [
     "dist",
     "config.example.yaml",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "check": "npm run clean && npm run build && npm run typecheck && npm test",
+    "prepack": "npm run clean && npm run build",
+    "prepublishOnly": "npm run check"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.20.2",

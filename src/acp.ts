@@ -12,6 +12,7 @@
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
 import {
   RollingPreview,
   SessionRecorder,
@@ -22,7 +23,11 @@ import {
 
 export const PROTOCOL_VERSION = 1;
 export const CLIENT_NAME = "harness-acp-bridge";
-export const CLIENT_VERSION = "0.1.0";
+// Both src/ (tests) and dist/ (published CLI) live one level below package.json.
+// Keep the MCP/ACP handshake version in sync with `npm version`.
+export const CLIENT_VERSION: string = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+).version;
 
 // Bound the work spent on misbehaving harness output: within the budget only the
 // offending line is dropped; beyond it the transport is closed.
