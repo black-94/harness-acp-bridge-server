@@ -1,0 +1,121 @@
+schema_version: 1
+
+paths:
+  # Base directory that holds session directories. null means ~/.harness-acp-bridge,
+  # so each session lands in ~/.harness-acp-bridge/<date>-<random>/.
+  state_dir: null
+  # null means: same as state_dir (sessions are created directly under it).
+  session_dir: null
+
+server:
+  # null means: $XDG_RUNTIME_DIR/harness-acp-bridge (or /tmp/harness-acp-bridge-<uid>)
+  socket_path: null
+  lock_path: null
+  start_timeout_seconds: 10
+
+sessions:
+  # Maximum live sessions the daemon will hold.
+  max_concurrency: 2
+  # Idle sessions (nothing running/queued, no pending answer) are closed after this.
+  # 0 disables idle reaping.
+  idle_timeout_seconds: 3600
+  reap_interval_seconds: 30
+
+transport:
+  startup_timeout_seconds: 60
+  turn_timeout_seconds: 1800
+  turn_cancel_timeout_seconds: 5
+  terminate_grace_seconds: 5
+  # Timeout for docker/ssh cleanup commands run after a session ends.
+  remote_cleanup_timeout_seconds: 10
+  stderr_tail_lines: 200
+
+buffers:
+  # A single ACP stdout line larger than this FAILS the current message (line_too_large)
+  # and closes the transport; oversized lines are never silently skipped.
+  max_read_bytes: 100MiB
+  # Turn-output spool threshold carried from the reference. This port keeps a turn's text in
+  # memory, so the value is accepted but not enforced (no output is failed/truncated for it).
+  max_output_bytes: 128KiB
+  # Rolling preview kept per session for polling callers (also caps preview.txt).
+  preview_bytes: 16KiB
+
+launch:
+  # Programs used to reach a harness. These are never caller-supplied.
+  ssh_command: ssh
+  docker_command: docker
+  # Default command per built-in harness; a harness entry may override it with `command`.
+  codebuddy_command: codebuddy
+  codex_command: codex-acp
+  agy_command: agy_acp_server
+  # Agy ACP mode ids, one per permission mode. `yolo` defaults to the ACP mode id "yolo";
+  # read/edit require explicit ids, while auto can leave the harness default.
+  agy_read_mode_id: null
+  agy_edit_mode_id: null
+  agy_auto_mode_id: null
+  agy_yolo_mode_id: null
+
+authentication:
+  # How long an `authenticate` round trip may take (interactive logins are slow). On
+  # timeout the session is closed and cleaned up.
+  timeout_seconds: 600
+  # How many distinct harness+target authentications may run at once. Same-target calls
+  # are always serialized, so two sessions never write the same target's credentials at
+  # the same time.
+  max_concurrent_targets: 2
+  # Private attempt ledger (JSON, written atomically, mode 0600). null means
+  # <state_dir>/auth-rate.json. It stores only SHA-256 target hashes and timestamps.
+  ledger_path: null
+  rate_limit:
+    # false disables the ledger completely: no file is read or written and every
+    # authentication attempt is allowed.
+    enabled: true
+    # Minimum spacing between two attempts against the same harness+target.
+    min_interval_seconds: 60
+    # Maximum attempts per harness+target inside window_seconds.
+    max_attempts: 10
+    window_seconds: 86400
+
+default_harness: codebuddy
+
+# Each harness must be one of the built-in adapters (codebuddy / codex / agy); the adapter
+# owns its argument construction and permission-mode routing.
+# `models` is the configured model list; ACP-advertised models are merged on top.
+# `harness_info` reports each harness's routable permission modes and its configured models.
+harnesses:
+  codebuddy:
+    # optional: falls back to launch.codebuddy_command
+    command: codebuddy
+    args: []
+    env: {}
+    models:
+      - id: claude-sonnet-4
+        name: Claude Sonnet 4
+        # Optional. Thinking levels this model may be configured with. `harness_info` reports
+        # them and create_session/set_model reject any other level. Omit the key when unknown:
+        # it is then reported as null and only the harness's live ACP config options are
+        # checked (the bridge never assumes a level is supported). An empty list declares that
+        # the model supports none.
+        thinking_levels:
+          - low
+          - medium
+          - high
+      - id: gpt-5
+        name: GPT-5
+        # thinking_levels omitted => unknown (reported as null by harness_info).
+
+  codex:
+    command: codex-acp
+    args: []
+    env: {}
+    models:
+      - id: gpt-5-codex
+        name: GPT-5 Codex
+
+  agy:
+    command: agy_acp_server
+    args: []
+    env: {}
+    models:
+      - id: gemini-2.5-pro
+        name: Gemini 2.5 Pro
