@@ -2278,6 +2278,8 @@ describe("daemon over IPC", () => {
     // the caller can reuse the kept container in a later session.
     const containerId = "a".repeat(64);
     expect(session.created.docker_id).toBe(containerId);
+    expect(clientMessages(session.directory).find((message) => message.method === "session/new")?.params)
+      .toMatchObject({ cwd: "/work", mcpServers: [] });
     const launch = session.created.launch_info as Record<string, unknown>;
     expect(launch).toMatchObject({
       runtime: "docker",
@@ -2297,10 +2299,12 @@ describe("daemon over IPC", () => {
 
   it("launches over a remote SSH wrapper, tracks the pid file, and cleans up", async () => {
     const fixture = await startDaemon({ mockSsh: true });
-    const { sessionId, created } = await createSession(fixture.client, fixture.dir, {
+    const { sessionId, created, directory } = await createSession(fixture.client, fixture.dir, {
       target: "remote",
       remote_host: "build-host",
     });
+    expect(clientMessages(directory).find((message) => message.method === "session/new")?.params)
+      .toMatchObject({ cwd: fixture.dir, mcpServers: [] });
 
     const launch = created.launch_info as Record<string, unknown>;
     expect(launch).toMatchObject({ target: "remote", runtime: "direct", remote_host: "build-host" });

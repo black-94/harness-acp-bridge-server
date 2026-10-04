@@ -2017,6 +2017,9 @@ function createAcpClient(
   return new AcpClient({
     command: process.execPath,
     args: [supervisorScriptPath()],
+    // The supervisor runs locally; the ACP cwd belongs to the harness target and must
+    // not be used as the local spawn cwd (it may exist only inside remote Docker).
+    sessionCwd: spec.cwd,
     env: { [SUPERVISOR_SPEC_ENV]: JSON.stringify(supervisorSpec) },
     configuredModels: [],
     recorder,

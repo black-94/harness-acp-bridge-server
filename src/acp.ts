@@ -199,6 +199,8 @@ export interface AcpClientOptions {
   env?: Record<string, string>;
   /** Working directory for the spawned transport; `undefined` inherits (docker/remote). */
   cwd?: string;
+  /** Harness working directory sent over ACP; may exist only on a remote/container target. */
+  sessionCwd?: string;
   /** Configured model list used when the harness does not advertise its own. */
   configuredModels?: AcpModel[];
   /** Opt-in append-only recording of redacted raw ACP traffic. */
@@ -375,6 +377,7 @@ export class AcpClient extends EventEmitter {
   private readonly terminateGraceMs: number;
   private readonly supervisorShutdownMs: number;
   private readonly metadataPath: string | null;
+  private readonly sessionCwd: string;
   private readonly configuredModels: AcpModel[];
   private readonly recorder: SessionRecorder | null;
   private readonly preview: RollingPreview;
@@ -406,6 +409,7 @@ export class AcpClient extends EventEmitter {
   constructor(options: AcpClientOptions) {
     super();
     this.options = { command: options.command, cwd: options.cwd, args: options.args, env: options.env };
+    this.sessionCwd = options.sessionCwd ?? options.cwd ?? process.cwd();
     this.clientName = options.clientName ?? CLIENT_NAME;
     this.clientVersion = options.clientVersion ?? CLIENT_VERSION;
     this.maxReadBytes = options.maxReadBytes ?? DEFAULT_MAX_READ_BYTES;
@@ -565,8 +569,8 @@ export class AcpClient extends EventEmitter {
     if (this.sessionId) return this.sessionId;
     if (!this.running) throw new AcpError("harness ACP transport is not running");
     const response = resumeSessionId
-      ? await this.request("session/load", { sessionId: resumeSessionId, cwd: this.options.cwd, mcpServers: [] })
-      : await this.request("session/new", { cwd: this.options.cwd, mcpServers: [] });
+      ? await this.request("session/load", { sessionId: resumeSessionId, cwd: this.sessionCwd, mcpServers: [] })
+      : await this.request("session/new", { cwd: this.sessionCwd, mcpServers: [] });
     this.updateModelInfo(response);
     this.updateConfigOptions(response);
     const result = isRecord(response.result) ? response.result : null;
@@ -941,8 +945,8 @@ export class AcpClient extends EventEmitter {
   /**
    * Route one decoded JSON-RPC message.
    *
-   * Returns `false` when the frame is not a recognized response, request, or `session/update`
-   * notification, so the caller can fail the message instead of silently ignoring it.
+   * Returns `false` when the frame is not a recognized response, request, session update,
+   * or supported vendor notification. Unknown/malformed frames still fail closed.
    */
   private dispatch(message: unknown): boolean {
     if (!isRecord(message)) return false;
@@ -961,6 +965,25 @@ export class AcpClient extends EventEmitter {
     const method = message.method;
     if (hasId && typeof method === "string") {
       this.handleIncomingRequest(id as number | string, method, isRecord(message.params) ? message.params : {});
+      return true;
+    }
+    // Real Codex/CodeBuddy versions emit these out-of-band login notifications during
+    // initialize/authenticate. They are advisory, not RPC responses or proof of login;
+    // status probing and session opening must still complete normally. The raw recorder
+    // already retains a redacted copy (including the login URL) for callers to inspect.
+    if (method === "_auth/status_update" || method === "_codebuddy.ai/authUrl" || method === "_codebuddy.ai/command") {
+      if (message.jsonrpc !== "2.0" || "id" in message || !isRecord(message.params)) return false;
+      const params = message.params;
+      if (method === "_auth/status_update") {
+        if (!isRecord(params.authStatus) || typeof params.authStatus.kind !== "string") return false;
+      } else if (method === "_codebuddy.ai/authUrl") {
+        if (typeof params.authUrl !== "string") return false;
+      } else if (typeof params.sessionId !== "string" || typeof params.action !== "string" || !isRecord(params.params)) {
+        return false;
+      }
+      // CodeBuddy's `command` notification describes UI state (e.g. workspace_info);
+      // never interpret its action as a command to execute or a permission approval.
+      this.emit(method === "_codebuddy.ai/command" ? "vendorNotification" : "authNotification", redactSensitive({ method, params }));
       return true;
     }
     if (method === "session/update") {
