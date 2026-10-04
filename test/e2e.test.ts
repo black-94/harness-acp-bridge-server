@@ -1660,8 +1660,17 @@ describe("daemon over IPC", () => {
         (call.params as Record<string, unknown>).configId === configId);
       expect(index).toBeGreaterThan(-1);
       expect(commands[index]?.params).toEqual({ sessionId: "fake-1", configId, value: "high" });
-      if (harness !== "codebuddy") {
-        expect(commands.findIndex((call) => call.method === "session/set_model")).toBeLessThan(index);
+      if (harness === "codex") {
+        const modelIndex = commands.findIndex(call => call.method === "session/set_config_option" &&
+          (call.params as Record<string, unknown>).configId === "model");
+        expect(modelIndex).toBeGreaterThan(-1);
+        expect(modelIndex).toBeLessThan(index);
+        expect(commands[modelIndex]?.params).toEqual({ sessionId: "fake-1", configId: "model", value: "fake-model" });
+        expect(commands.some(call => call.method === "session/set_model")).toBe(false);
+      } else if (harness === "agy") {
+        const modelIndex = commands.findIndex(call => call.method === "session/set_model");
+        expect(modelIndex).toBeGreaterThan(-1);
+        expect(modelIndex).toBeLessThan(index);
       }
     }
     await stopDaemon(fixture);
@@ -1995,6 +2004,12 @@ describe("daemon over IPC", () => {
     expect(idle.waited_ms as number).toBeGreaterThanOrEqual(400);
     expect(Date.now() - startedAt).toBeLessThan(5000);
     await fixture.client.call("cancel_message", { session_id: sessionId, message_id: heldId });
+    // Cancellation marks the message terminal before the ACP operation has settled.
+    // Wait for the reusable session, not just the cancel acknowledgement.
+    await waitUntilAsync(async () => {
+      const status = await fixture.client.call("message_result", { session_id: sessionId });
+      return status.operation === "idle";
+    });
 
     // Case 2: output arrives while the long-poll is in flight -> returns promptly with it.
     const asking = await fixture.client.call("send_message", { session_id: sessionId, text: "please permission" });

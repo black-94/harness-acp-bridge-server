@@ -264,15 +264,40 @@ level:
    assumed, and only check 2 applies. An empty list accepts no level.
 2. **Live ACP options.** When the harness advertises model-specific config options, an
    unsupported level is rejected; otherwise the harness validates the request. Because
-   `session/set_model` drops the previous model's options, `set_model` always checks the level
-   against the **new** model's advertised options.
+   model selection drops the previous model's options and caches refreshed response options,
+   `set_model` always checks against the **new** model's advertised options.
 
 On `set_model` the declared-level check runs **before** switching, so an undeclared level
 leaves the model unchanged; a level rejected only by the new model's live options surfaces as
 an error after the switch. Agy's Gemini 2.x models cannot apply this setting and reject it
 explicitly. Omitting `thinking_level` behaves differently per tool: on `create_session` it
-keeps the harness default; on `set_model` it changes only the model and leaves the reasoning
-level untouched (it is **not** re-applied to the new model).
+keeps the harness default; on `set_model` the bridge does **not** re-apply a reasoning
+level. The harness may adjust the current level if the new model does not support it.
+
+#### Codex model IDs and executable selection
+
+Configure and pass base model IDs (for example `gpt-5-codex`) and a separate
+`thinking_level` (`low`, `medium`, `high`, or `xhigh`, **if supported by that model**).
+The Codex adapter selects `model` via `session/set_config_option`; reasoning suffixes
+are not required in the configuration. Advertised legacy `model[effort]` variants are
+collapsed to base IDs in `harness_models`. Explicit bracketed IDs remain backward compatible.
+For older ACP servers without a model option, the adapter converts a base ID internally
+using the **observed current effort**. If the effort is unknown, it fails rather than inventing
+a default. Only a method-not-found error triggers fallback; invalid models, authentication
+failures and timeouts are never retried through a different selector. The harness may adjust
+an unsupported effort when selecting a new model; an explicit `thinking_level` is applied
+and validated after the switch.
+
+A successful setter or a `ready` session alone is not proof of the effective settings.
+For verification, inspect the harness's returned `configOptions`/`session/update`
+`currentValue` for `model` and the reasoning option. If no readback is provided, the request
+is accepted but the final value remains unconfirmed. This verifies session configuration,
+not which model an upstream provider actually runs during generation.
+
+`codex-acp` can bundle its own Codex CLI. To use a specific installed version, set
+`harnesses.codex.env.CODEX_PATH` to its absolute executable path. This is per-harness
+configuration, not a global environment change. MCP clients may omit arbitrary shell
+variables, so do not rely on a shell-only `CODEX_PATH` reaching the harness.
 
 `permission_mode` accepts `read`, `edit`, `auto`, or `yolo` (default: `auto`). Routing is per
 adapter: CodeBuddy maps the mode to `--permission-mode` on argv (it also receives `--model`

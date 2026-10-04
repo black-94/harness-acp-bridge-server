@@ -258,8 +258,60 @@ describe("adapters", () => {
         return {};
       },
     });
+    await getAdapter("codebuddy").setModel(client, "m2");
+    await getAdapter("agy").setModel(client, "m2");
+    await getAdapter("codex").setModel(client, "m2[high]");
+    expect(calls).toEqual([
+      { sessionId: "s1", modelId: "m2" },
+      { sessionId: "s1", modelId: "m2" },
+      { sessionId: "s1", modelId: "m2[high]" },
+    ]);
+  });
+
+  it.each([null, [{ id: "model", options: [{ value: "m2" }] }]])("selects a bare Codex model via the modern option (options=%s)", async options => {
+    const calls: Array<Record<string, unknown>> = [];
+    const response = { result: { configOptions: [{ id: "reasoning_effort", currentValue: "low" }] } };
+    const client = stubClient({ "session/set_config_option": params => { calls.push(params); return response; } });
+    client.configOptions = () => options;
+    expect(await getAdapter("codex").setModel(client, "m2")).toEqual(response);
+    expect(calls).toEqual([{ sessionId: "s1", configId: "model", value: "m2" }]);
+  });
+
+  it.each([false, true])("uses only the observed effort for legacy Codex fallback (advertised=%s)", async advertised => {
+    const calls: Array<Record<string, unknown>> = [];
+    const client = stubClient({ "session/set_model": params => { calls.push(params); return {}; } });
+    client.configOptions = () => advertised ? [{ id: "reasoning_effort", currentValue: "low" }] : null;
+    client.modelId = () => "m1[low]";
     await getAdapter("codex").setModel(client, "m2");
-    expect(calls).toEqual([{ sessionId: "s1", modelId: "m2" }]);
+    expect(calls).toEqual([{ sessionId: "s1", modelId: "m2[low]" }]);
+  });
+
+  it("does not fabricate a legacy Codex effort when none was observed", async () => {
+    const client = stubClient({});
+    client.configOptions = () => [];
+    await expect(getAdapter("codex").setModel(client, "m2")).rejects.toThrow(/observed reasoning effort/);
+  });
+
+  it.each([-32602, -32000, -32603])("never retries a rejected modern model selection (code=%s)", async code => {
+    const calls: string[] = [];
+    const client = stubClient({
+      "session/set_config_option": () => { calls.push("modern"); throw Object.assign(new Error("rejected"), { code }); },
+      "session/set_model": () => { calls.push("legacy"); return {}; },
+    });
+    client.modelId = () => "m1[low]";
+    await expect(getAdapter("codex").setModel(client, "bad-model")).rejects.toMatchObject({ code });
+    expect(calls).toEqual(["modern"]);
+  });
+
+  it("rejects contradictory model and effort readbacks instead of trusting an acknowledgement", async () => {
+    const modelClient = stubClient({
+      "session/set_config_option": () => ({ result: { configOptions: [{ id: "model", currentValue: "m1" }] } }),
+    });
+    await expect(getAdapter("codex").setModel(modelClient, "m2")).rejects.toThrow(/harness reported model/);
+    const effortClient = stubClient({
+      "session/set_config_option": () => ({ result: { configOptions: [{ id: "reasoning_effort", currentValue: "low" }] } }),
+    });
+    await expect(getAdapter("codex").setThinkingLevel(effortClient, "s1", "m2", "high", null)).rejects.toThrow(/harness reported reasoning_effort/);
   });
 
   it("reads CodeBuddy account info through the whitelist only", async () => {

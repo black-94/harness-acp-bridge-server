@@ -13,6 +13,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
+import type { HarnessAdapter } from "./adapters.js";
 import {
   RollingPreview,
   SessionRecorder,
@@ -203,6 +204,8 @@ export interface AcpClientOptions {
   sessionCwd?: string;
   /** Configured model list used when the harness does not advertise its own. */
   configuredModels?: AcpModel[];
+  /** Harness-owned model selection (the transport still owns state and busy checks). */
+  modelAdapter?: HarnessAdapter;
   /** Opt-in append-only recording of redacted raw ACP traffic. */
   recorder?: SessionRecorder | null;
   maxReadBytes?: number;
@@ -379,6 +382,8 @@ export class AcpClient extends EventEmitter {
   private readonly metadataPath: string | null;
   private readonly sessionCwd: string;
   private readonly configuredModels: AcpModel[];
+  private readonly modelAdapter: HarnessAdapter | undefined;
+  private observedReasoningEffort: string | null = null;
   private readonly recorder: SessionRecorder | null;
   private readonly preview: RollingPreview;
   private readonly logger: AcpLogger;
@@ -421,6 +426,7 @@ export class AcpClient extends EventEmitter {
     this.supervisorShutdownMs = options.supervisorShutdownMs ?? this.terminateGraceMs;
     this.metadataPath = options.metadataPath ?? null;
     this.configuredModels = options.configuredModels ?? [];
+    this.modelAdapter = options.modelAdapter;
     this.recorder = options.recorder ?? null;
     this.preview = new RollingPreview();
     this.logger = options.logger ?? {};
@@ -494,7 +500,21 @@ export class AcpClient extends EventEmitter {
    * initialize / session creation take precedence over the configured list.
    */
   listModels(): AcpModel[] {
-    return this.availableModels.length > 0 ? this.availableModels.map((m) => ({ ...m })) : this.configuredModels.map((m) => ({ ...m }));
+    const models = this.availableModels.length > 0 ? this.availableModels : this.configuredModels;
+    if (this.modelAdapter?.name !== "codex") return models.map((model) => ({ ...model }));
+    // Codex's legacy discovery expands every model into model[effort] variants.
+    // Expose the same base IDs used by the modern model option and our config.
+    const option = this.sessionConfigOptions?.find((entry) => entry.id === "model" || entry.configId === "model");
+    if (Array.isArray(option?.options)) {
+      const advertised = option.options.filter(isRecord).filter((entry) => typeof entry.value === "string");
+      if (advertised.length > 0) return advertised.map((entry) => ({ id: entry.value as string, name: typeof entry.name === "string" ? entry.name : entry.value as string }));
+    }
+    const unique = new Map<string, AcpModel>();
+    for (const model of models) {
+      const id = model.id.replace(/\[[^\]]+\]$/, "");
+      if (!unique.has(id)) unique.set(id, { id, name: model.name.replace(/ \((?:low|medium|high|xhigh|max|ultra|minimal)\)$/, "") });
+    }
+    return [...unique.values()];
   }
 
   /** Null means the harness did not advertise config options; [] means none are supported. */
@@ -589,12 +609,21 @@ export class AcpClient extends EventEmitter {
     if (this.turnActive || this.pendingInteraction !== null) {
       throw new AcpError("cannot switch model while a turn is active");
     }
-    const response = await this.request("session/set_model", { sessionId: this.sessionId, modelId: target });
+    const response = this.modelAdapter
+      ? await this.modelAdapter.setModel({
+          sessionId: () => this.sessionId,
+          initializeResponse: () => this.initializeResponse,
+          configOptions: () => this.sessionConfigOptions,
+          modelId: () => this.modelId,
+          reasoningEffort: () => this.observedReasoningEffort,
+          request: (method, params) => this.request(method, params),
+        }, target)
+      : await this.request("session/set_model", { sessionId: this.sessionId, modelId: target });
     // A new model may support different levels; don't validate against stale options.
     this.sessionConfigOptions = null;
     this.updateConfigOptions(response);
     this.modelId = target;
-    this.modelName = this.modelNames.get(target) ?? target;
+    this.modelName = this.listModels().find((model) => model.id === target)?.name ?? this.modelNames.get(target) ?? target;
   }
 
   /** Authenticate the harness with one of its advertised `authMethods`. */
@@ -824,13 +853,30 @@ export class AcpClient extends EventEmitter {
 
   async request(method: string, params: Record<string, unknown>): Promise<JsonRpcMessage> {
     const id = this.nextId++;
-    return new Promise<JsonRpcMessage>((resolve, reject) => {
+    const response = await new Promise<JsonRpcMessage>((resolve, reject) => {
       this.pending.set(id, { method, resolve, reject });
       this.send({ jsonrpc: "2.0", id, method, params }).catch((error: unknown) => {
         this.pending.delete(id);
         reject(error instanceof Error ? error : new AcpError(String(error)));
       });
     });
+    if (method === "session/set_config_option") {
+      // Option setters also return refreshed model-specific options. Cache them even
+      // when called by an adapter directly (e.g. reasoning effort after selection).
+      this.updateConfigOptions(response);
+      const result = isRecord(response.result) ? response.result : null;
+      const returnedEffort = Array.isArray(result?.configOptions)
+        ? result.configOptions.filter(isRecord).find(option => option.id === "reasoning_effort" || option.configId === "reasoning_effort")
+        : undefined;
+      if (params.configId === "reasoning_effort" && typeof params.value === "string" && typeof returnedEffort?.currentValue !== "string") {
+        // Legacy acknowledgements lack readback. Retain the accepted command for
+        // compatibility, but never overwrite an actual (possibly contradictory) value.
+        this.observedReasoningEffort = params.value;
+      }
+    } else if (method === "session/set_model" && typeof params.modelId === "string") {
+      this.observedReasoningEffort = params.modelId.match(/\[([^\]]+)\]$/)?.[1] ?? this.observedReasoningEffort;
+    }
+    return response;
   }
 
   async notify(method: string, params: Record<string, unknown>): Promise<void> {
@@ -1107,6 +1153,8 @@ export class AcpClient extends EventEmitter {
     const result = isRecord(response.result) ? response.result : null;
     if (result && Array.isArray(result.configOptions)) {
       this.sessionConfigOptions = result.configOptions.filter(isRecord);
+      const effort = this.sessionConfigOptions.find((option) => option.id === "reasoning_effort" || option.configId === "reasoning_effort");
+      if (typeof effort?.currentValue === "string") this.observedReasoningEffort = effort.currentValue;
     }
   }
 
@@ -1116,7 +1164,10 @@ export class AcpClient extends EventEmitter {
     const models = isRecord(result.models) ? result.models : result;
     const current = models.currentModelId ?? models.current_model_id ?? models.modelId ?? models.model;
     const currentId = isRecord(current) ? current.modelId ?? current.id : current;
-    if (typeof currentId === "string" && currentId) this.modelId = currentId;
+    if (typeof currentId === "string" && currentId) {
+      this.modelId = currentId;
+      this.observedReasoningEffort = currentId.match(/\[([^\]]+)\]$/)?.[1] ?? this.observedReasoningEffort;
+    }
 
     const available = models.availableModels;
     if (Array.isArray(available)) {

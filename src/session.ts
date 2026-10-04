@@ -515,7 +515,7 @@ function interactionDict(interaction: AcpInteraction): AcpInteractionDict {
  * Build a harness argv through its adapter.
  *
  * CodeBuddy takes managed ACP flags on the command line; Codex/Agy are driven purely over
- * ACP (mode via their ACP methods, model via `session/set_model`). Retained as a thin
+ * ACP (mode and model selection routed through their adapters). Retained as a thin
  * helper so callers do not need to know about adapters.
  */
 export function buildHarnessArgv(
@@ -746,7 +746,7 @@ export class BridgeSession {
         : null;
     const transport =
       options.transport ??
-      createAcpClient(spec, options.config, recorder, options.logger, metadataPath as string);
+      createAcpClient(spec, options.config, recorder, options.logger, metadataPath as string, adapter);
     const session = new BridgeSession(
       options,
       harness,
@@ -2012,6 +2012,7 @@ function createAcpClient(
   recorder: SessionRecorder,
   logger: AcpLogger | undefined,
   metadataPath: string,
+  modelAdapter: HarnessAdapter,
 ): AcpTransport {
   const supervisorSpec: SupervisorSpec = { ...spec, metadataPath, daemonPid: process.pid };
   return new AcpClient({
@@ -2022,6 +2023,7 @@ function createAcpClient(
     sessionCwd: spec.cwd,
     env: { [SUPERVISOR_SPEC_ENV]: JSON.stringify(supervisorSpec) },
     configuredModels: [],
+    modelAdapter,
     recorder,
     metadataPath,
     maxReadBytes: config.buffers.maxReadBytes,

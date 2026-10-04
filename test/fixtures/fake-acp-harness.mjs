@@ -273,7 +273,15 @@ function handle(message) {
     return;
   }
   if (message.method === "session/set_config_option") {
-    reply(message.id, { configId: message.params?.configId, value: message.params?.value });
+    if (message.params?.configId === "model") {
+      model = message.params.value;
+      reply(message.id, { configOptions: [
+        { id: "model", currentValue: model, options: AVAILABLE_MODELS.map(entry => ({ value: entry.modelId, name: entry.name })) },
+        { id: "reasoning_effort", currentValue: "low", options: (model === "fake-model-2" ? ["low"] : ["low", "high"]).map(value => ({ value })) },
+      ] });
+    } else {
+      reply(message.id, { configId: message.params?.configId, value: message.params?.value });
+    }
     return;
   }
   if (message.method === "session/set_mode") {

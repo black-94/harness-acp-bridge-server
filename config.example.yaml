@@ -107,10 +107,16 @@ harnesses:
   codex:
     command: codex-acp
     args: []
+    # Optional: use an installed Codex CLI instead of codex-acp's bundled version.
+    # env:
+    #   CODEX_PATH: /absolute/path/to/codex
     env: {}
     models:
+      # Keep the base ID separate from thinking_level; the adapter owns ACP routing.
       - id: gpt-5-codex
         name: GPT-5 Codex
+        # Declare only the levels actually advertised by your installed model.
+        # thinking_levels: [low, medium, high, xhigh]
 
   agy:
     command: agy_acp_server

@@ -64,6 +64,10 @@ export interface AdapterConfig {
 export interface AdapterClient {
   sessionId(): string | null;
   initializeResponse(): Record<string, unknown>;
+  /** Current live options/model, used only for protocol compatibility routing. */
+  configOptions?(): Array<Record<string, unknown>> | null;
+  modelId?(): string | null;
+  reasoningEffort?(): string | null;
   request(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
 }
 
@@ -80,7 +84,7 @@ export interface HarnessAdapter {
   buildArgv(config: AdapterConfig): string[];
   getAuthInfo(client: AdapterClient, initializeResponse: Record<string, unknown>): Promise<AuthInfo>;
   authenticate(client: AdapterClient, methodId: string): Promise<AuthInfo>;
-  setModel(client: AdapterClient, modelId: string): Promise<void>;
+  setModel(client: AdapterClient, modelId: string): Promise<Record<string, unknown>>;
   /** Harness-specific permission-mode routing; default is a no-op. */
   setMode(client: AdapterClient, config: AdapterConfig, sessionId: string): Promise<void>;
   /** Apply the requested reasoning level for the selected model (never silently ignore it). */
@@ -161,8 +165,8 @@ abstract class BaseAdapter implements HarnessAdapter {
     return this.getAuthInfo(client, client.initializeResponse());
   }
 
-  async setModel(client: AdapterClient, modelId: string): Promise<void> {
-    await client.request("session/set_model", { sessionId: client.sessionId(), modelId });
+  async setModel(client: AdapterClient, modelId: string): Promise<Record<string, unknown>> {
+    return client.request("session/set_model", { sessionId: client.sessionId(), modelId });
   }
 
   async setMode(_client: AdapterClient, _config: AdapterConfig, _sessionId: string): Promise<void> {
@@ -195,7 +199,8 @@ abstract class BaseAdapter implements HarnessAdapter {
         }
       }
     }
-    await client.request("session/set_config_option", { sessionId, configId, value: level });
+    const response = await client.request("session/set_config_option", { sessionId, configId, value: level });
+    assertReturnedOption(response, configId, level);
   }
 }
 
@@ -256,6 +261,38 @@ export class CodeBuddyAdapter extends BaseAdapter {
 
 export class CodexAdapter extends BaseAdapter {
   readonly name: HarnessName = "codex";
+
+  /** Keep public model IDs independent of reasoning effort and legacy ACP syntax. */
+  override async setModel(client: AdapterClient, modelId: string): Promise<Record<string, unknown>> {
+    // Preserve existing callers that explicitly select a legacy model[effort] ID.
+    if (/\[[^\]]+\]$/.test(modelId)) return super.setModel(client, modelId);
+    const options = client.configOptions?.() ?? null;
+    const hasModelOption = options?.some((option) => option.id === "model" || option.configId === "model");
+    if (options === null || hasModelOption) {
+      try {
+        const response = await client.request("session/set_config_option", {
+          sessionId: client.sessionId(), configId: "model", value: modelId,
+        });
+        assertReturnedOption(response, "model", modelId);
+        return response;
+      } catch (error) {
+        // Only a missing method proves this interface is unavailable. Never retry
+        // invalid models, permission/auth failures or timeouts through another API.
+        if (rpcCode(error) !== -32601) throw error;
+      }
+    }
+    // Older codex-acp requires model[effort]. Carry the *observed* current effort
+    // across the switch; never invent [high] or silently replace a user's choice.
+    const effortOption = options?.find((option) => option.id === "reasoning_effort" || option.configId === "reasoning_effort");
+    const current = client.modelId?.();
+    const effort = typeof effortOption?.currentValue === "string"
+      ? effortOption.currentValue
+      : client.reasoningEffort?.() ?? current?.match(/\[([^\]]+)\]$/)?.[1];
+    if (!effort) {
+      throw new AdapterError("legacy codex model selection requires an observed reasoning effort; upgrade codex-acp or use an explicit model[effort] ID");
+    }
+    return super.setModel(client, `${modelId}[${effort}]`);
+  }
 
   /** Codex selects its permission mode through a session config option, not argv. */
   override async setMode(client: AdapterClient, config: AdapterConfig, sessionId: string): Promise<void> {
@@ -327,6 +364,16 @@ export function supportedPermissionModes(
     if (mode === "auto" || mode === "yolo") return true;
     return Boolean(agyModeIds[mode]);
   });
+}
+
+/** Acknowledgement alone is not a readback. Reject a contradictory value when provided. */
+function assertReturnedOption(response: Record<string, unknown>, configId: string, requested: string): void {
+  const result = isRecord(response.result) ? response.result : null;
+  if (!Array.isArray(result?.configOptions)) return;
+  const option = result.configOptions.filter(isRecord).find(entry => entry.id === configId || entry.configId === configId);
+  if (option && "currentValue" in option && option.currentValue !== requested) {
+    throw new AdapterError(`harness reported ${configId}=${JSON.stringify(option.currentValue)} after requesting ${JSON.stringify(requested)}`);
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
