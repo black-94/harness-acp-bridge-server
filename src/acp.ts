@@ -320,6 +320,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+/** A JSON number that is finite (rejects `Infinity`/`-Infinity` from e.g. `1e999`). */
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -1013,23 +1018,40 @@ export class AcpClient extends EventEmitter {
       this.handleIncomingRequest(id as number | string, method, isRecord(message.params) ? message.params : {});
       return true;
     }
-    // Real Codex/CodeBuddy versions emit these out-of-band login notifications during
-    // initialize/authenticate. They are advisory, not RPC responses or proof of login;
-    // status probing and session opening must still complete normally. The raw recorder
-    // already retains a redacted copy (including the login URL) for callers to inspect.
-    if (method === "_auth/status_update" || method === "_codebuddy.ai/authUrl" || method === "_codebuddy.ai/command") {
+    // Real Codex/CodeBuddy versions emit these out-of-band notifications during
+    // initialize/authenticate or a turn. They are advisory, not RPC responses, proof of
+    // login, or turn events; status probing and session opening must still complete
+    // normally. The raw recorder already retains a redacted copy (including the login URL)
+    // for callers to inspect.
+    if (
+      method === "_auth/status_update" ||
+      method === "_codebuddy.ai/authUrl" ||
+      method === "_codebuddy.ai/command" ||
+      method === "_codebuddy.ai/checkpoint"
+    ) {
       if (message.jsonrpc !== "2.0" || "id" in message || !isRecord(message.params)) return false;
       const params = message.params;
       if (method === "_auth/status_update") {
         if (!isRecord(params.authStatus) || typeof params.authStatus.kind !== "string") return false;
       } else if (method === "_codebuddy.ai/authUrl") {
         if (typeof params.authUrl !== "string") return false;
-      } else if (typeof params.sessionId !== "string" || typeof params.action !== "string" || !isRecord(params.params)) {
+      } else if (method === "_codebuddy.ai/command") {
+        if (typeof params.sessionId !== "string" || typeof params.action !== "string" || !isRecord(params.params)) {
+          return false;
+        }
+      } else if (!AcpClient.isCheckpointNotification(params)) {
         return false;
       }
-      // CodeBuddy's `command` notification describes UI state (e.g. workspace_info);
-      // never interpret its action as a command to execute or a permission approval.
-      this.emit(method === "_codebuddy.ai/command" ? "vendorNotification" : "authNotification", redactSensitive({ method, params }));
+      // `command` describes CodeBuddy UI state (e.g. workspace_info) and `checkpoint`
+      // describes file-checkpoint activity. Both are advisory observations only: never
+      // interpret an action as a command to execute, a permission approval, a rollback,
+      // or a turn-completion signal.
+      this.emit(
+        method === "_codebuddy.ai/command" || method === "_codebuddy.ai/checkpoint"
+          ? "vendorNotification"
+          : "authNotification",
+        redactSensitive({ method, params }),
+      );
       return true;
     }
     if (method === "session/update") {
@@ -1040,6 +1062,36 @@ export class AcpClient extends EventEmitter {
       return true;
     }
     return false;
+  }
+
+  /**
+   * Minimal structural validation for a CodeBuddy `_codebuddy.ai/checkpoint` broadcast.
+   *
+   * CodeBuddy emits this when it creates/updates/reverts a file checkpoint; the shape is
+   * `{ sessionId, event, checkpoint: { id, createdAt, fileChanges: { files, totalAdditions,
+   * totalDeletions } } }` (see its `CheckpointBroadcastInfo`). The bridge only observes the
+   * notification — it never replays, rolls back, or executes anything from it — so only the
+   * required fields are type-checked. Required numbers must be finite (a JSON frame can carry
+   * `1e999`, which parses to `Infinity` and is not a valid timestamp/count). Optional per-file
+   * detail (`diff`, `additions`, ...) and optional `label`/`revertedAt` are retained as-is by
+   * the raw recorder, not interpreted.
+   */
+  private static isCheckpointNotification(params: Record<string, unknown>): boolean {
+    const { sessionId, event, checkpoint } = params;
+    if (typeof sessionId !== "string" || typeof event !== "string" || !isRecord(checkpoint)) return false;
+    if (typeof checkpoint.id !== "string" || !isFiniteNumber(checkpoint.createdAt)) return false;
+    const fileChanges = checkpoint.fileChanges;
+    if (!isRecord(fileChanges)) return false;
+    if (
+      !Array.isArray(fileChanges.files) ||
+      !isFiniteNumber(fileChanges.totalAdditions) ||
+      !isFiniteNumber(fileChanges.totalDeletions)
+    ) {
+      return false;
+    }
+    return fileChanges.files.every(
+      (file) => isRecord(file) && typeof file.uri === "string" && typeof file.changeType === "string",
+    );
   }
 
   private handleIncomingRequest(id: number | string, method: string, params: Record<string, unknown>): void {

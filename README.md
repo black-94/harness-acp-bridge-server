@@ -626,6 +626,18 @@ before the first release (the e2e suite below uses mocks).
   `answer_question` instead. Any other unrecognized JSON-RPC notification (for example
   `elicitation/complete`, which only URL mode would need) fails the message as
   `malformed_message`.
+- **Supported vendor notifications** — a small, closed set of Codex/CodeBuddy
+  out-of-band notifications is accepted as **advisory observations only**:
+  `_auth/status_update`, `_codebuddy.ai/authUrl`, `_codebuddy.ai/command`, and
+  `_codebuddy.ai/checkpoint`. They are type-checked (JSON-RPC 2.0, no `id`, valid `params`),
+  emitted redacted, and never drive bridge/session/turn state: they are not RPC responses,
+  proof of login, permission approvals, commands to execute, rollbacks, or turn-completion
+  signals, and they are not folded into `text`/`tool_calls`. In particular
+  `_codebuddy.ai/checkpoint` (`event: created`/`updated`/`reverted` with a
+  `checkpoint` summary) is only observed — the bridge never replays or reverts it. An
+  id-bearing frame for any of these methods is a normal reverse request (answered
+  `-32601`), and any other notification method still fails as `malformed_message`; the
+  bridge never accepts `_codebuddy.ai/*` indiscriminately.
 - **Live turn resumption after a daemon restart** — a restarted daemon (or a closed
   session) can *read* the previous run's state, results, and preview, and reconciles
   in-flight messages to a terminal `failed` / `orphaned` state, but it cannot resume the

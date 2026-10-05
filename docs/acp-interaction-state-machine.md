@@ -100,6 +100,22 @@ Rationale: once a stream is out of sync there is no protocol-level way to resync
 newline-delimited JSON-RPC connection — any "skip and continue" risks attributing an old
 frame to a new turn, so the bridge always fails closed.
 
+### Advisory vendor notifications (not desynchronizing)
+
+A small, closed set of out-of-band Codex/CodeBuddy notifications is recognized and treated
+as **advisory observations**: `_auth/status_update`, `_codebuddy.ai/authUrl`,
+`_codebuddy.ai/command`, and `_codebuddy.ai/checkpoint`. Each is structurally validated
+(JSON-RPC 2.0, no `id` field — `id: null` is rejected — and valid `params`) and then emitted
+redacted on the `authNotification`/`vendorNotification` channels. They are **not** RPC
+responses or reverse requests, do **not** settle `session/prompt`, do **not** move the
+operation slot, and are never folded into a turn's `text`/`tool_calls` or used as a
+completion signal. `_codebuddy.ai/checkpoint` (a file-checkpoint broadcast with
+`event: created`/`updated`/`reverted`) is observed only — the bridge never replays, rolls
+back, or executes it. A frame for any of these methods that carries an `id` is a normal
+reverse request (answered `-32601` when unsupported), and any other notification method is
+an unrecognized frame that still fails `malformed_message`. The bridge never accepts
+`_codebuddy.ai/*` indiscriminately.
+
 ## Interaction (waiting_input) sub-state
 
 While `running`, the harness may issue a reverse request (`session/request_permission`,
