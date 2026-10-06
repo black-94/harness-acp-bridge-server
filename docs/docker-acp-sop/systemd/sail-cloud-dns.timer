@@ -1,0 +1,11 @@
+[Unit]
+Description=Reconcile the narrow Aliyun DNS reply exception after firewall updates
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=30s
+AccuracySec=5s
+Unit=sail-cloud-dns.service
+
+[Install]
+WantedBy=timers.target

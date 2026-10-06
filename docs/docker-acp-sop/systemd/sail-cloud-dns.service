@@ -1,0 +1,11 @@
+[Unit]
+Description=Allow established replies from the two Aliyun DNS servers before Tailscale
+After=ufw.service tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sail-cloud-dns-replies.py
+TimeoutStartSec=30s
+
+[Install]
+WantedBy=multi-user.target
