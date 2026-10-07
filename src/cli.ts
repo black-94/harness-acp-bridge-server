@@ -25,6 +25,7 @@ import {
   type BridgeConfig,
 } from "./config.js";
 import { DaemonClient, IpcError } from "./ipc.js";
+import { redactSensitive } from "./persistence.js";
 
 const SERVER_NAME = "harness-acp-bridge";
 const NOTIFICATION_LOGGER = "harness-acp-bridge";
@@ -471,6 +472,6 @@ async function main(): Promise<void> {
 
 main().catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`harness-acp-bridge failed to start: ${message}\n`);
+  process.stderr.write(`harness-acp-bridge failed to start: ${String(redactSensitive(message))}\n`);
   process.exit(1);
 });

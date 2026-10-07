@@ -9,6 +9,7 @@
  */
 import { configArgument, loadConfig, resolveConfigPath } from "../config.js";
 import { HarnessDaemon } from "./server.js";
+import { redactSensitive } from "../persistence.js";
 
 async function main(): Promise<void> {
   const explicit = configArgument(process.argv.slice(2));
@@ -32,6 +33,6 @@ async function main(): Promise<void> {
 
 main().catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`harness-acp-bridge daemon failed to start: ${message}\n`);
+  process.stderr.write(`harness-acp-bridge daemon failed to start: ${String(redactSensitive(message))}\n`);
   process.exit(1);
 });

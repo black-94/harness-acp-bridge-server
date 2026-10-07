@@ -9,11 +9,12 @@
  * `DaemonClient` also owns auto-start: if the socket is missing or refused it spawns
  * `dist/daemon/main.js` detached and waits for `ping` to succeed.
  */
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync } from "node:fs";
-import { connect } from "node:net";
+import { connect, type Socket } from "node:net";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { redactSensitive } from "./persistence.js";
 
 export const IPC_PROTOCOL_VERSION = 1;
 /** Bound on a single IPC request or response line. */
@@ -22,6 +23,7 @@ const DEFAULT_START_TIMEOUT_MS = 10_000;
 const DEFAULT_CALL_TIMEOUT_MS = 60_000;
 const PING_TIMEOUT_MS = 2000;
 const START_POLL_INTERVAL_MS = 50;
+const MAX_STARTUP_STDERR_CHARS = 8192;
 
 export class IpcError extends Error {
   override name = "IpcError";
@@ -55,8 +57,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    if (typeof timer.unref === "function") timer.unref();
+    setTimeout(resolve, ms);
   });
 }
 
@@ -131,27 +132,69 @@ export class DaemonClient {
   /** Spawn the daemon if needed and wait until it answers `ping`. */
   async ensureDaemon(): Promise<void> {
     if (await this.ping()) return;
-    mkdirSync(dirname(this.options.socketPath), { recursive: true, mode: 0o700 });
     const entry = this.options.daemonEntry ?? defaultDaemonEntry();
+    const context = `entry=${entry}; config=${this.options.configPath ?? "<default>"}; socket=${this.options.socketPath}; lock=${this.options.lockPath}`;
+    const failure = (reason: string, stderr = "", code = "daemon_start_failed"): IpcError =>
+      new IpcError(code, String(redactSensitive(
+        `harness-acp-bridge daemon failed to start (${context}): ${reason}${stderr ? `\nstderr: ${stderr}` : ""}`,
+      )));
     const args = [entry];
     if (this.options.configPath) args.push("--config", this.options.configPath);
     const spawnImpl = this.options.spawnImpl ?? spawn;
-    const child = spawnImpl(process.execPath, args, {
-      detached: true,
-      stdio: "ignore",
-      env: process.env,
-    });
+    let child: ChildProcess;
+    try {
+      mkdirSync(dirname(this.options.socketPath), { recursive: true, mode: 0o700 });
+      child = spawnImpl(process.execPath, args, {
+        detached: true,
+        stdio: ["ignore", "ignore", "pipe"],
+        env: process.env,
+      });
+    } catch (error) {
+      throw failure(error instanceof Error ? error.message : String(error));
+    }
     child.unref?.();
 
+    // Keep only a bounded prefix: a tail could cut off a credential's key before
+    // redaction. Redact the combined text on exposure, including split stderr chunks.
+    let stderr = "";
+    let collecting = true;
+    let stopped: string | undefined;
+    let wake!: () => void;
+    const childStopped = new Promise<void>((resolve) => { wake = resolve; });
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      if (collecting) stderr += chunk.slice(0, MAX_STARTUP_STDERR_CHARS - stderr.length);
+    });
+    child.once("error", (error) => { stopped = error.message; wake(); });
+    // close follows stderr EOF, so early-exit diagnostics include its final output.
+    child.once("close", (code, signal) => {
+      stopped ??= signal ? `terminated by signal ${signal}` : `exited with code ${code}`;
+      wake();
+    });
+
     const deadline = Date.now() + this.startTimeoutMs;
-    while (Date.now() < deadline) {
-      await delay(START_POLL_INTERVAL_MS);
+    try {
+      while (Date.now() < deadline) {
+        // A concurrent launcher may have won the singleton lock. Prefer the live
+        // daemon over this child's exit, rather than reporting a false failure.
+        if (await this.ping()) return;
+        const singletonRace = stderr.includes("a harness-acp-bridge daemon is already running");
+        if (stopped !== undefined && !singletonRace) throw failure(stopped, stderr);
+        const pause = delay(Math.min(START_POLL_INTERVAL_MS, Math.max(1, deadline - Date.now())));
+        // A lock winner may still be binding its socket; keep the normal readiness
+        // budget for that case without spinning on an already-resolved promise.
+        await (stopped !== undefined ? pause : Promise.race([pause, childStopped]));
+      }
       if (await this.ping()) return;
+      if (stopped !== undefined) throw failure(stopped, stderr);
+      throw failure(`did not become ready within ${this.startTimeoutMs}ms`, stderr, "daemon_start_timeout");
+    } finally {
+      collecting = false;
+      stderr = "";
+      // Continue draining after startup without retaining output or keeping the
+      // MCP process alive; the detached daemon must survive client disconnects.
+      (child.stderr as Socket | null)?.unref?.();
     }
-    throw new IpcError(
-      "daemon_start_timeout",
-      `harness-acp-bridge daemon did not become ready within ${this.startTimeoutMs}ms`,
-    );
   }
 
   private send(payload: string, timeoutMs: number): Promise<Record<string, unknown>> {

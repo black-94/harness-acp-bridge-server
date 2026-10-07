@@ -6,10 +6,11 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ConfigError,
+  configArgument,
   declaredThinkingLevels,
   findModel,
   harnessInfo,
@@ -19,6 +20,7 @@ import {
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const cleanup of cleanups.splice(0)) cleanup();
 });
 
@@ -57,6 +59,31 @@ harnesses:
 launch:
   agy_edit_mode_id: agy-edit
 `;
+
+describe("configuration path diagnostics", () => {
+  it.each([{ argv: ["--config"] }, { argv: ["--config", "--other"] }, { argv: ["--config="] }, { argv: ["--config", " "] }])(
+    "rejects missing --config paths: $argv", ({ argv }) => {
+      expect(() => configArgument(argv)).toThrow("--config requires a non-empty YAML file path");
+    },
+  );
+  it("accepts both explicit config forms", () => {
+    expect(configArgument(["--config", "./config.yaml"])).toBe("./config.yaml");
+    expect(configArgument(["--config=./config.yaml"])).toBe("./config.yaml");
+  });
+  it("names a missing explicit or environment-selected YAML path", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "hab-config-")), "missing.yaml");
+    cleanups.push(() => rmSync(join(path, ".."), { recursive: true, force: true }));
+    expect(() => loadConfig(path)).toThrow(`configured YAML file does not exist: ${path}`);
+    vi.stubEnv("HARNESS_ACP_BRIDGE_CONFIG", path);
+    expect(() => loadConfig()).toThrow(`configured YAML file does not exist: ${path}`);
+  });
+  it("rejects a directory used as the YAML file with a contextual ConfigError", () => {
+    const dir = mkdtempSync(join(tmpdir(), "hab-config-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    expect(() => loadConfig(dir)).toThrow(ConfigError);
+    expect(() => loadConfig(dir)).toThrow(`could not read configured YAML file ${dir}: EISDIR`);
+  });
+});
 
 describe("model thinking_levels declaration", () => {
   it("parses declared, empty, and undeclared thinking levels", () => {

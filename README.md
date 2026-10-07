@@ -36,6 +36,15 @@ The daemon is auto-started by the MCP client on the first call that needs it (de
 socket and lock from the configuration). A PID lock file plus the socket bind make it a
 singleton; a second daemon on the same lock exits with an error.
 
+Startup failures report `daemon_start_failed` promptly, with the daemon entry, config,
+socket and lock paths, the spawn/exit reason, and bounded, credential-redacted stderr.
+A process that stays alive without becoming ready reports `daemon_start_timeout` with
+the same diagnostics. An already-running daemon is reused, including when another
+launcher wins the singleton race. Missing/unreadable YAML files and a missing `--config`
+value are explicit startup errors (stderr, exit status 1), never silently defaulted.
+If the MCP client's CLI entry path itself is missing, no server code can run: the client
+must validate that entry or surface Node's stderr.
+
 ## Install
 
 Requires **Node.js >= 20.11** on **macOS or Linux**. Windows is not supported.

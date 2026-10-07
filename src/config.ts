@@ -305,7 +305,13 @@ function stableStringify(value: unknown): string {
 }
 
 function readConfigFile(path: string): FileConfig {
-  const text = readFileSync(path, "utf8");
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    const cause = error as NodeJS.ErrnoException;
+    throw new ConfigError(`could not read configured YAML file ${path}: ${cause.code ?? cause.name} (${cause.message})`);
+  }
   let raw: unknown;
   try {
     raw = parseYaml(text);
@@ -447,8 +453,13 @@ function resolveConfig(file: FileConfig, configPath: string | null): BridgeConfi
 export function configArgument(argv: string[]): string | undefined {
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
-    if (value === "--config") return argv[index + 1];
-    if (value?.startsWith("--config=")) return value.slice("--config=".length);
+    if (value === "--config" || value?.startsWith("--config=")) {
+      const path = value === "--config" ? argv[index + 1] : value.slice("--config=".length);
+      if (!path?.trim() || (value === "--config" && path.startsWith("--"))) {
+        throw new ConfigError("--config requires a non-empty YAML file path");
+      }
+      return path;
+    }
   }
   return undefined;
 }
