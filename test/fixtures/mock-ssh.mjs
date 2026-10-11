@@ -32,7 +32,9 @@ if (host === "missing-host") {
   process.exit(255);
 }
 
-const child = spawn("/bin/sh", ["-c", command], { stdio: "inherit" });
+// `$MOCK_SSH_SHELL` pins the remote shell: the default `/bin/sh` is dash on Linux and bash on
+// macOS, and the wrapper must behave the same on both.
+const child = spawn(process.env.MOCK_SSH_SHELL || "/bin/sh", ["-c", command], { stdio: "inherit" });
 child.on("exit", (code, signal) => process.exit(signal ? 1 : (code ?? 0)));
 child.on("error", (error) => {
   process.stderr.write(`mock-ssh: ${error.message}\n`);

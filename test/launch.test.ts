@@ -467,6 +467,16 @@ describe("runtime argument builders", () => {
     expect(command).toContain("trap ");
     // The pid file is a single safe token inside the wrapper.
     expect(command).toContain('pid_file="$remote_tmp"/harness-acp-abc.pid');
+    // A shell without job control (dash without a tty) assigns a background command's stdin to
+    // /dev/null, so the ACP channel is passed through a descriptor no shell rewrites.
+    expect(command).toContain("exec 3<&0");
+    expect(command).toContain('codebuddy --acp <&3 &');
+    // Cleanup signals the harness group when it really is one, and the pid when the harness
+    // shares the wrapper's group; it never signals a group it cannot prove is separate.
+    expect(command).toContain('harness_target=-"$harness_pgid"');
+    expect(command).toContain('harness_target="$harness_pid"');
+    expect(command).toContain('kill -TERM "$harness_target"');
+    expect(command).toContain('kill -KILL "$harness_target"');
 
     // Env is injected for the remote program.
     const withEnv = remoteCommand(spec({ harnessEnv: { A: "1" } }));

@@ -1,4 +1,4 @@
-import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -336,5 +336,23 @@ describe("HTTP server contract and session state machine", () => {
       expect(commands).toContain("run"); expect(commands).toContain("exec"); expect(commands).toContain("rm");
     }
     if (launch.target === "remote") expect(readFileSync(sshLog, "utf8")).toContain("mock-host");
+  });
+  // Linux `/bin/sh` is dash, which refuses job control without a tty and would otherwise hand
+  // the backgrounded harness `/dev/null` as stdin, detaching the ACP channel at creation time.
+  // macOS `/bin/sh` is bash, so the shim has to be pinned to a real dash to cover it.
+  const dashShell = existsSync("/bin/dash") ? "/bin/dash" : null;
+  it.skipIf(dashShell === null)("keeps the remote ACP channel on a shell without job control (dash)", async () => {
+    const ssh = fileURLToPath(new URL("./fixtures/mock-ssh.mjs", import.meta.url));
+    const app = await setup({ launch: { ssh_command: ssh }, timeouts: { remote_cleanup_timeout_seconds: 2, terminate_grace_seconds: 0.05 } });
+    const sshLog = join(app.directory, "ssh.jsonl");
+    vi.stubEnv("MOCK_SSH_LOG", sshLog);
+    vi.stubEnv("MOCK_SSH_SHELL", dashShell as string);
+    const created = await app.request("create_session", { cwd: app.directory, model_id: "fake-model", target: "remote", remote_host: "mock-host" });
+    expect(created.ok, JSON.stringify(created)).toBe(true);
+    const session = created.data.session_id;
+    const message = (await app.request("send_message", { session_id: session, text: "dash-ready" })).data.message_id;
+    expect((await app.complete(session, message)).result.text).toBe("echo:dash-ready");
+    await app.request("close_session", { session_id: session });
+    expect(readFileSync(sshLog, "utf8")).toContain("mock-host");
   });
 });

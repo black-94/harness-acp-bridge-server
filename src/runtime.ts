@@ -203,6 +203,17 @@ export function dockerExecArgv(spec: LaunchSpec): string[] {
  * The remote shell wrapper: run the harness in the background, record its pid/pgid, and kill
  * the whole remote process group (plus the container) on exit.
  *
+ * Two POSIX-shell hazards are handled explicitly, because the remote shell is often dash (the
+ * Linux `/bin/sh`) rather than bash:
+ *
+ *  - dash refuses job control when the session has no tty (`set -m` only warns and stays off),
+ *    and a POSIX shell then assigns the stdin of an asynchronous command to `/dev/null`. The
+ *    harness stdin *is* the ACP channel, so it must be passed through a descriptor the shell
+ *    does not rewrite: the wrapper duplicates its stdin onto fd 3 and hands that to the harness.
+ *  - Without job control the harness is not a group leader but shares the wrapper's group, so
+ *    the cleanup signals the harness pid instead of the group: signalling the group would kill
+ *    this wrapper mid-trap and silently skip the container cleanup and pid-file removal.
+ *
  * For Docker the `cwd` is a container path and the harness enters the container via
  * `docker exec --workdir`, so the wrapper must not `cd` to it on the host.
  */
@@ -220,11 +231,13 @@ export function remoteCommand(spec: LaunchSpec, program: string[] = dockerExecAr
   if (spec.dockerContainerName) {
     dockerCleanup = `${shellJoin([spec.dockerCommand, ...containerCleanupArgs(spec)])} >/dev/null 2>&1 || true; `;
   }
+  // `harness_target` is a pid, or `-pgid` so the whole remote group is signalled when the
+  // harness really does lead one.
   const cleanup =
-    'if [ -n "$harness_pgid" ]; then ' +
-    'kill -TERM -"$harness_pgid" 2>/dev/null || true; ' +
+    'if [ -n "$harness_target" ]; then ' +
+    'kill -TERM "$harness_target" 2>/dev/null || true; ' +
     `sleep ${grace}; ` +
-    'kill -KILL -"$harness_pgid" 2>/dev/null || true; ' +
+    'kill -KILL "$harness_target" 2>/dev/null || true; ' +
     "fi; " +
     dockerCleanup +
     'rm -f "$pid_file"';
@@ -239,16 +252,26 @@ export function remoteCommand(spec: LaunchSpec, program: string[] = dockerExecAr
     `pid_file="$remote_tmp"/${pidFile}`,
     "harness_pid=''",
     "harness_pgid=''",
+    "harness_target=''",
+    'shell_pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d " ")',
+    "exec 3<&0",
     `trap ${shellQuote(cleanup)} EXIT`,
     "trap 'exit 143' HUP TERM INT",
-    "set -m || exit 1",
-    `${programText} &`,
+    // Job control is what makes the harness its own group leader; a shell that cannot grant it
+    // (no tty) is tolerated, and the cleanup then signals the pid only.
+    "set -m 2>/dev/null || true",
+    `${programText} <&3 &`,
     "harness_pid=$!",
     'harness_pgid=$(ps -o pgid= -p "$harness_pid" 2>/dev/null | tr -d " ")',
     // With job control, this single-command job leads its own process group. Some
     // restricted hosts deny ps even for a process we just launched.
     'if [ -z "$harness_pgid" ]; then harness_pgid="$harness_pid"; fi',
-    'case "$harness_pgid" in ""|*[!0-9]*) exit 1 ;; esac',
+    'case "$harness_pgid" in ""|*[!0-9]*) harness_target="$harness_pid"; exit 1 ;; esac',
+    // An unreadable wrapper pgid is treated like a shared one: never signal a group we cannot
+    // prove is separate from our own.
+    'if [ -n "$shell_pgid" ] && [ "$harness_pgid" != "$shell_pgid" ]; then',
+    '  harness_target=-"$harness_pgid"',
+    'else harness_target="$harness_pid"; fi',
     'printf "%s %s\\n" "$harness_pid" "$harness_pgid" > "$pid_file"',
     'wait "$harness_pid"',
   ].join("\n");
