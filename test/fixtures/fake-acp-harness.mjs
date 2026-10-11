@@ -63,6 +63,7 @@ let pendingPermission = null;
 let pendingInfo = null;
 let pendingElicitation = null;
 let authenticated = !AUTH_REQUIRED;
+let optionsHang = FLAGS.has("--options-hang");
 
 const AVAILABLE_MODELS = [
   { modelId: "fake-model", name: "Fake Model" },
@@ -87,12 +88,35 @@ function finishPrompt(promptId, stopReason) {
 }
 
 function startPrompt(id, text) {
-  pendingPrompt = { id, done: false, timer: null };
+  pendingPrompt = { id, text, done: false, timer: null };
+  if (text.includes("arm-options-hang")) optionsHang = true;
   const echo = `echo:${text}`;
   const middle = Math.ceil(echo.length / 2);
   chunk(echo.slice(0, middle));
   chunk(echo.slice(middle));
 
+  if (text.includes("unknown-notice")) {
+    send({ jsonrpc: "2.0", method: "vendor/notice", params: { token: "raw-original-token", value: "通知原文" } });
+    chunk(" after-unknown"); finishPrompt(id, "end_turn"); return;
+  }
+  if (text.includes("unknown-request")) {
+    send({ jsonrpc: "2.0", id: 9400, method: "vendor/request", params: { custom: true } });
+    chunk(" after-request"); finishPrompt(id, "end_turn"); return;
+  }
+  if (text.includes("reasoning-tools")) {
+    update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "正在分析问题😀" } });
+    update({ sessionUpdate: "tool_call", toolCallId: "tc-1", title: "Read file", status: "in_progress", rawInput: { path: "example.ts" } });
+    update({ sessionUpdate: "tool_call_update", toolCallId: "tc-1", status: "completed", rawOutput: { value: 42 }, content: [{ type: "content", content: { type: "text", text: "工具输出结果" } }] });
+    finishPrompt(id, "end_turn"); return;
+  }
+  if (text.includes("repair-json")) {
+    const frame = { jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "repaired😀" } } } };
+    process.stdout.write("\ufeff\x1b[32m" + JSON.stringify(frame) + "\x1b[0m\r\n");
+    finishPrompt(id, "end_turn"); return;
+  }
+  if (text.includes("unsupported-result")) {
+    send({ jsonrpc: "2.0", id, result: { vendorFinal: true } }); return;
+  }
   if (text.includes("HOLD")) {
     pendingPrompt.timer = setTimeout(() => {
       if (pendingPrompt && pendingPrompt.id === id && !pendingPrompt.done) {
@@ -241,6 +265,7 @@ function startPrompt(id, text) {
 
 function handle(message) {
   if (message.method === "initialize") {
+    if (FLAGS.has("--handshake-hang")) return;
     reply(message.id, {
       protocolVersion: 1,
       authMethods: AUTH_REQUIRED ? [{ id: "api-key", name: "API key" }] : [],
@@ -273,6 +298,7 @@ function handle(message) {
     return;
   }
   if (message.method === "session/set_config_option") {
+    if (optionsHang) return;
     if (message.params?.configId === "model") {
       model = message.params.value;
       reply(message.id, { configOptions: [
@@ -307,6 +333,7 @@ function handle(message) {
     return;
   }
   if (message.method === "session/cancel") {
+    if (pendingPrompt?.text?.includes("IGNORE_CANCEL")) return;
     if (pendingPrompt && !pendingPrompt.done) {
       clearTimeout(pendingPrompt.timer);
       finishPrompt(pendingPrompt.id, "cancelled");

@@ -10,7 +10,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ConfigError,
-  configArgument,
   declaredThinkingLevels,
   findModel,
   harnessInfo,
@@ -32,7 +31,7 @@ function configFromText(text: string): BridgeConfig {
   return loadConfig(path);
 }
 
-const DECLARED = `schema_version: 1
+const DECLARED = `schema_version: 2
 default_harness: codebuddy
 harnesses:
   codebuddy:
@@ -61,15 +60,6 @@ launch:
 `;
 
 describe("configuration path diagnostics", () => {
-  it.each([{ argv: ["--config"] }, { argv: ["--config", "--other"] }, { argv: ["--config="] }, { argv: ["--config", " "] }])(
-    "rejects missing --config paths: $argv", ({ argv }) => {
-      expect(() => configArgument(argv)).toThrow("--config requires a non-empty YAML file path");
-    },
-  );
-  it("accepts both explicit config forms", () => {
-    expect(configArgument(["--config", "./config.yaml"])).toBe("./config.yaml");
-    expect(configArgument(["--config=./config.yaml"])).toBe("./config.yaml");
-  });
   it("names a missing explicit or environment-selected YAML path", () => {
     const path = join(mkdtempSync(join(tmpdir(), "hab-config-")), "missing.yaml");
     cleanups.push(() => rmSync(join(path, ".."), { recursive: true, force: true }));
@@ -101,7 +91,7 @@ describe("model thinking_levels declaration", () => {
   it("rejects a malformed thinking_levels value", () => {
     expect(() =>
       configFromText(
-        `schema_version: 1
+        `schema_version: 2
 harnesses:
   codebuddy:
     command: codebuddy

@@ -10,7 +10,7 @@ export default defineConfig({
     include: ["test/**/*.test.ts"],
     testTimeout: 40000,
     hookTimeout: 40000,
-    // The daemon tests spawn real child processes and unix sockets; running files in
+    // HTTP integration tests spawn real supervisors and child processes; running files in
     // parallel is fine, but keep a single fork per file to reduce flakiness.
     pool: "forks",
     poolOptions: {

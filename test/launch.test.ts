@@ -350,7 +350,8 @@ describe("adapters", () => {
     expect(normalizeAuthStatus({ result: { kind: "api-key" } }, []).authenticated).toBe(true);
     expect(normalizeAuthStatus({ result: { kind: "none" } }, []).authenticated).toBe(false);
     expect(normalizeAuthStatus({ result: { type: "chat-gpt" } }, []).authenticated).toBe(true);
-    expect(normalizeAuthStatus({ result: { type: "unknown" } }, []).authenticated).toBe(false);
+    expect(() => normalizeAuthStatus({ result: { type: "unknown" } }, [])).toThrow(AuthStatusUnsupported);
+    expect(() => normalizeAuthStatus({ result: { kind: "unrecognized-login" } }, [])).toThrow(AuthStatusUnsupported);
     // The account is whitelisted, and an email alone is enough.
     const withAccount = normalizeAuthStatus(
       { result: { authenticated: true, account: { email: "a@b.c", token: "t" } } },

@@ -1,656 +1,202 @@
-# @black942026/harness-acp-bridge-server
+# harness-acp-bridge-server
 
-Bridge an ACP harness (CodeBuddy / Codex / any ACP agent) to an MCP client through an
-asynchronous, per-session message loop.
+A session-scoped HTTP server for ACP harnesses. It owns harness processes, serializes
+message execution, records original traffic, and renders human-readable live output.
 
-Submission and completion are decoupled: `send_message` returns a `message_id`
-**immediately**, and the upstream (MCP client or pi-extension) polls `message_result` and
-`live_output` for progress. Nothing blocks on a harness turn. A session runs **one message at
-a time**: a second submit while one is queued/running/waiting is rejected with `busy`.
+## Run
 
-## Architecture
+Requires Node.js >= 20.11 on macOS/Linux and separately installed ACP harnesses.
 
-```
-MCP client ──stdio──▶ cli.js (thin MCP server)
-                          │  newline-delimited JSON over a Unix socket
-                          ▼
-                    daemon (dist/daemon/main.js)
-                          │  session registry: one BridgeSession per session
-                          ▼
-                    ACP JSON-RPC 2.0 over stdio  ──▶  harness process
-```
-
-- **`src/acp.ts`** — ACP transport: spawn the session supervisor, newline-framed JSON-RPC,
-  bounded oversized-line handling, turn/interaction plumbing, redacted raw recording.
-- **`src/supervisor.ts`** — the per-session supervisor process (port of the reference
-  `supervisor.py`): prepares the container, owns the harness process group, proxies stdio
-  byte-for-byte, and cleans up when the daemon closes the session or dies.
-- **`src/session.ts`** — `BridgeSession`: the one-message-at-a-time loop, message states,
-  interactions, `live_output` offsets, and lifecycle.
-- **`src/persistence.ts`** — session directory, append-only redacted raw stream, rolling
-  preview, atomic snapshots.
-- **`src/daemon/`** — the Unix-socket daemon, session registry, singleton lock, reaper.
-- **`src/cli.ts`** — the MCP stdio server; a thin client over the daemon.
-
-The daemon is auto-started by the MCP client on the first call that needs it (detached,
-socket and lock from the configuration). A PID lock file plus the socket bind make it a
-singleton; a second daemon on the same lock exits with an error.
-
-Startup failures report `daemon_start_failed` promptly, with the daemon entry, config,
-socket and lock paths, the spawn/exit reason, and bounded, credential-redacted stderr.
-A process that stays alive without becoming ready reports `daemon_start_timeout` with
-the same diagnostics. An already-running daemon is reused, including when another
-launcher wins the singleton race. Missing/unreadable YAML files and a missing `--config`
-value are explicit startup errors (stderr, exit status 1), never silently defaulted.
-If the MCP client's CLI entry path itself is missing, no server code can run: the client
-must validate that entry or surface Node's stderr.
-
-## Install
-
-Requires **Node.js >= 20.11** on **macOS or Linux**. Windows is not supported.
-Install the ACP harness you plan to use separately and make its command available on `PATH`
-(or configure an absolute command path). Docker and SSH are optional, needed only for their
-respective launch modes. This package does not bundle harnesses or credentials.
-
-```bash
-npm install -g @black942026/harness-acp-bridge-server
-harness-acp-bridge --config /abs/path/to/config.yaml
-```
-
-The package includes prebuilt JavaScript and `config.example.yaml`; no TypeScript build is
-needed after installing from npm. Copy the example config from the installed package
-(`$(npm root -g)/@black942026/harness-acp-bridge-server/config.example.yaml`) and adjust it for
-your harnesses and models. `--config` is optional (see [Configuration](#configuration)).
-
-## Development / build
-
-```bash
+```sh
 npm ci
-npm run check      # clean build + typecheck + unit/mock-CLI/MCP stdio e2e tests
+npm run build
+HARNESS_ACP_BRIDGE_CONFIG=./config.example.yaml npm start
 ```
 
-This is a CLI/MCP server package, not a supported JavaScript library API.
+The service entrypoint is `dist/main.js`; the package has no CLI executables or MCP
+server. Configuration is resolved from `HARNESS_ACP_BRIDGE_CONFIG`, the XDG/default
+config location, then built-in defaults. All settings use schema version 2; unknown
+fields and older schema versions are rejected. Defaults bind `127.0.0.1:8787`.
 
-The e2e suite runs a real daemon and a real MCP stdio client against a fake ACP harness, and
-drives **mock `docker` and `ssh` CLIs** (`test/fixtures/mock-docker.mjs`,
-`test/fixtures/mock-ssh.mjs`) so the generated container/remote command lines, cleanup
-policy, and pid-file handling are exercised without touching a real engine or host.
+For embedding, import `HarnessHttpServer` and `loadConfig` from the package, call
+`start()`, and call `stop()` to close the listener and its sessions.
 
-## Running the MCP server (stdio)
+## Five layers
 
-The CLI is a standard **stdio** MCP server: it speaks newline-delimited JSON-RPC on
-stdin/stdout. Run it without a global installation using an explicit package and binary
-(the package provides two binaries, so do not rely on npx's binary inference):
-
-```jsonc
-{
-  "mcpServers": {
-    "harness-acp-bridge": {
-      "command": "npx",
-      "args": ["--yes", "--package=@black942026/harness-acp-bridge-server", "harness-acp-bridge", "--config", "/abs/path/to/config.yaml"]
-    }
-  }
-}
+```text
+Main agent --HTTP POST--> http/server.ts --> logic/service.ts + logic/session.ts
+                                              |
+                                              v
+                                  adapter/protocol.ts + adapters.ts
+                                              |
+                                              v
+                                   transport/stdio.ts --stdio--> harness
+                                              |
+                                              v
+                                          raw.jsonl
+                                              |
+                                              v
+                                      preview/reader.ts --> live_output
 ```
 
-For reproducible deployments, pin the package spec to a published version, for example
-`--package=@black942026/harness-acp-bridge-server@0.1.0`. With a global installation, use
-`"command": "harness-acp-bridge"` and `"args": ["--config", "/abs/path/to/config.yaml"]`.
+1. **Transport** manages byte streams, newline framing, and the supervisor. It writes
+   original outgoing bytes before sending them, and incoming bytes before delivering
+   complete lines to the adapter. It interprets no ACP or vendor methods. Oversized
+   lines are journaled in bounded fragments rather than retained in memory.
+2. **Adapter** implements ACP JSON-RPC and harness extensions for CodeBuddy, Codex,
+   and Agy. It correlates requests/responses, maps session options and reverse questions,
+   and reports unsupported requests, responses, and notifications with original content.
+   Common ACP operations take priority; missing methods may use a harness extension.
+3. **Logic** owns session operation slots, results, authentication coordination, idle
+   reaping, and handshake/request/message/cancel/authentication/input deadlines. It
+   decides whether to cancel a message or terminate its harness after an error.
+4. **HTTP** validates JSON requests, routes the twelve operations, returns JSON
+   envelopes, and handles client disconnects and SSE framing.
+5. **Preview** reads `raw.jsonl` directly and renders actual harness reasoning, answers,
+   tool calls, tool outputs, questions, and lifecycle events. It has no preview file and
+   retains no rolling text window.
 
-For a source checkout, point an MCP client at the built Node entrypoint directly:
+The supervisor owns the local harness process group and SSH/Docker cleanup. Server
+shutdown or loss of its parent/stdio triggers cleanup. One server owns a session directory;
+`.server.lock` prevents a second listener from recovering a live server's sessions.
 
-```jsonc
-{
-  "mcpServers": {
-    "harness-acp-bridge": {
-      "command": "node",
-      "args": ["/abs/path/to/harness-acp-bridge-server/dist/cli.js", "--config", "/abs/path/to/config.yaml"]
-    }
-  }
-}
-```
+## HTTP API
 
-Or run it by hand against a config (the installed bin name is `harness-acp-bridge`):
+All endpoints use **POST `/api/<name>`**, with `Content-Type: application/json`.
+The body is the parameter object itself, without a JSON-RPC wrapper.
 
-```bash
-node dist/cli.js --config ./config.example.yaml
-```
+Successful responses have `{ "ok": true, "data": { ... } }`.
+Errors have `{ "ok": false, "error": { "code": "...", "message": "...", "detail": ... } }`.
+Invalid parameters return 400; missing sessions/messages return 404; busy/closed sessions
+return 409; unsupported operations/responses return 501; deadlines return 504.
 
-`--config` is optional (see [Configuration](#configuration) for the fallback order).
-
-### Example: create → send_message → poll
-
-`send_message` returns immediately with only the message id; poll `message_result` (with the
-`message_id`) until `terminal` is true, then read the result from the same call. A second
-`send_message` while the first is still non-terminal fails with `busy` (see
-[`send_message`](#send_message-one-message-at-a-time)):
-
-```jsonc
-// 1. create a session
-create_session { "harness": "codebuddy", "cwd": "/work/repo", "model_id": "claude-sonnet-4" }
-//    -> { "session_id": "2026-01-01-ab12cd34", "state": "ready", "launch_info": { ... } }
-
-// 2. submit a prompt; this returns immediately with only the id
-send_message { "session_id": "2026-01-01-ab12cd34", "text": "explain this repo" }
-//    -> { "message_id": "msg_0192..." }
-
-// 3. poll the result until `terminal` is true (no text/tool_calls before then)
-message_result { "session_id": "2026-01-01-ab12cd34", "message_id": "msg_0192..." }
-//    -> { "state": "running", "terminal": false, ... }   (repeat)
-
-// 4. when terminal, the same call carries the result
-message_result { "session_id": "2026-01-01-ab12cd34", "message_id": "msg_0192..." }
-//    -> { "state": "completed", "terminal": true, "text": "...", "tool_calls": [ ... ] }
-```
-
-`live_output` streams the rolling preview by byte offset while the turn runs (and `wait_ms`
-turns it into a long-poll). See [Polling](#polling) and
-[`live_output` semantics](#live_output-semantics).
-
-## Configuration
-
-`config.example.yaml` is the full schema. The MCP client and the daemon read the same file,
-resolved in this order:
-
-1. `--config <path>` argument,
-2. `HARNESS_ACP_BRIDGE_CONFIG`,
-3. `$XDG_CONFIG_HOME/harness-acp-bridge/config.yaml` (or `~/.config/...`),
-4. built-in defaults.
-
-Key settings:
-
-| Key | Meaning |
+| Endpoint | Parameters and behavior |
 | --- | --- |
-| `paths.state_dir` | Base for session directories. Default `~/.harness-acp-bridge`. |
-| `paths.session_dir` | Where sessions are created. Defaults to `state_dir`, so a session lands in `~/.harness-acp-bridge/<date>-<random>/`. |
-| `server.socket_path` / `server.lock_path` | Runtime socket and lock. Default `$XDG_RUNTIME_DIR/harness-acp-bridge/` (or `/tmp/harness-acp-bridge-<uid>/`), kept apart from session data. |
-| `sessions.max_concurrency` | Maximum live sessions the daemon will hold. |
-| `sessions.idle_timeout_seconds` | Idle sessions (no running/queued message, no pending answer) are closed after this. `0` disables reaping. |
-| `transport.*` | Startup / turn / cancel / terminate timeouts, the docker+ssh cleanup timeout, and the stderr tail length. |
-| `buffers.max_read_bytes` | A single ACP stdout line above this **fails the current message** (`line_too_large`) and closes the transport; nothing is silently skipped. |
-| `buffers.max_output_bytes` | Turn-output spool threshold from the reference. This port keeps a turn's text in memory, so the value is accepted and echoed but not enforced (no output is truncated or failed because of it). |
-| `buffers.preview_bytes` | Cap for both the in-memory rolling preview and `preview.txt`. |
-| `launch.ssh_command` / `launch.docker_command` | Programs used to reach a harness. Never caller-supplied. |
-| `launch.<harness>_command` | Default command per built-in harness (overridable per harness entry). |
-| `launch.agy_<mode>_mode_id` | Agy ACP mode ids; read/edit require explicit ids, yolo defaults to `yolo`, auto can use the harness default. |
-| `authentication.timeout_seconds` | How long an `authenticate` round trip (credentials + session open) may take; on timeout the session is closed and cleaned up. |
-| `authentication.max_concurrent_targets` | How many distinct harness+target authentications may run at once. Same-target calls are always serialized. |
-| `authentication.ledger_path` | Private attempt ledger. Default `<state_dir>/auth-rate.json`. Stores only SHA-256 target hashes and timestamps. |
-| `authentication.rate_limit.enabled` | `false` disables the ledger entirely: nothing is read or written and every attempt is allowed. |
-| `authentication.rate_limit.min_interval_seconds` | Minimum spacing between two attempts on the same harness+target. |
-| `authentication.rate_limit.max_attempts` / `window_seconds` | Attempt budget per harness+target inside the window. |
-| `harnesses.<name>.models` | The configured **model list** (see `harness_info`). Each model is `id`, `name`, and an optional `thinking_levels` list. Omitting `thinking_levels` leaves the model's levels **unknown** (`null`); `[]` declares it supports none. |
-| `harnesses.<name>.description` | Optional human-readable note echoed by `harness_info`. |
+| `ping` | `{}`. Server liveness, protocol version, PID, live-session count, config fingerprint. |
+| `search_harness` | `harness?`. Lists configured harnesses, models, declared thinking levels, and permission modes. Starts no harness and performs no discovery probes. |
+| `create_session` | Required `cwd`, `model_id`; optional `harness`, `thinking_level`, `permission_mode`, and launch fields below. Returns the session snapshot, including `session_id`, state, effective options, and launch info. |
+| `close_session` | `session_id`. Stops the harness and closes the session; repeated close is safe. |
+| `authenticate` | `session_id`, `method_id`. Authenticates the child harness and opens its session. Credential writes on the same target are serialized and optionally rate limited. |
+| `auth_status` | `session_id`. Probes harness authentication. An unavailable probe returns an `unsupported_response` error with original response/details; unknown authentication is not guessed as logged out. |
+| `set_session_options` | `session_id` plus one or more of `model_id`, `thinking_level`, `permission_mode`. Applies only session settings, while idle. |
+| `send_message` | `session_id`, `text`, optional `idempotency_key`. Returns only `{ "message_id": "..." }` after durable acceptance; execution is asynchronous. |
+| `cancel_message` | `session_id`, `message_id`. Requests cancellation and waits for the original prompt to settle. An unconfirmed cancellation closes the session. |
+| `message_status` | `session_id`, `message_id`. Returns state, `terminal`, pending `questions`, unsupported events, and errors. Terminal messages additionally include `result`. Works after close/restart. |
+| `live_output` | `session_id`, optional `message_id`, `cursor`, `limit`, `wait_ms`. Returns paged journal-derived human-readable events; optionally SSE. |
+| `answer_question` | `session_id`, `message_id`, `request_id`, optional `answer` (`accept`, `reject`, `timeout`, `cancel`, default `accept`), `option_id`, `content`. Uses the child harness's original RPC ID. Permissions require an offered option; information/form answers require an object. |
 
-Harness names must be one of the built-in adapters (`codebuddy`, `codex`, `agy`); the adapter
-owns argument construction and permission-mode routing.
+Authentication here is the child harness's login, not HTTP client authentication.
+Commands, argv, environment, SSH/Docker programs, state paths, and buffer settings are
+administrator-owned configuration, not request parameters.
 
-## MCP tools
+`create_session` launch fields:
 
-| Tool | Notes |
-| --- | --- |
-| `ping` | Daemon liveness, pid, config fingerprint. |
-| `harness_info` | **Config file only.** For one harness (`harness`) or every configured harness: its `permission_modes` (what the adapter can actually route with the current config) and its configured models with `thinking_levels` (`null` = not declared/unknown). Never starts a harness or a daemon. |
-| `create_session` | Local **or remote (SSH)**, **direct or Docker**. Args: `cwd`, `model_id`, `thinking_level?`, `harness?`, `permission_mode?`, `target?`, `remote_host?`, `runtime?`, `docker_id?`, `docker_image?`, `container_policy?`, `mounts?`, `ports?`, `host_network?`, `resume_session_id?`, `authenticate?`, `session_id?`. |
-| `authenticate` | Completes a session that reported `authentication_required`. |
-| `auth_info` | Login boolean, auth method ids, model. Account fields are whitelisted; **never credentials**. |
-| `set_model` | Switch model between turns. Rejected with `busy` while a message is non-terminal (including while waiting for an answer). Optional `thinking_level` applies a level to the **new** model after it is selected; omit it to change only the model. |
-| `send_message` | **Asynchronous.** Returns only `{ "message_id": "..." }`. Rejected with `busy` while any message is non-terminal. Optional `idempotency_key` for replay-safe retries. |
-| `message_result` | Status **and** result: with `message_id`, the full status (`state`, `terminal`, pending `interaction`, `queue_position`, `error`) plus `text`/`tool_calls`/`harness_session_id` **only once terminal**; without `message_id`, whole-session status. Readable after close and restart. |
-| `answer_question` | Answer a pending **interaction** request with `answer: "accept" | "reject" | "timeout" | "cancel"` (default `accept`). Validates `request_id`; for `accept`, permission interactions require a valid `option_id` and information interactions require the answer object. |
-| `cancel_message` | Cancel a running message (or one waiting for an answer). |
-| `live_output` | Read the rolling preview by byte offset (see below). |
-| `close_session` | Cancel the running message, stop the harness, flush persistence. |
+- `target`: `local` (default) or `remote`; remote requires `remote_host`.
+- `runtime`: `direct` (default) or `docker`.
+- Docker: `docker_image` for a new container, or full 64-character `docker_id` for reuse;
+  `container_policy` (`remove`/`keep`), `mounts`, `ports`, and `host_network`.
+- `resume_session_id`: ask the harness to load its own existing session history.
+- `session_id`: optionally choose a new bridge session ID; existing directories are never overwritten.
+- `authenticate`: optional method ID, routed through the same authentication coordinator.
 
-### `harness_info` (configuration declaration)
+Permission modes are `read`, `edit`, `auto`, `yolo`. Adapters determine whether a particular
+harness supports changing a mode live. Declared `thinking_levels: []` means none;
+omission means unknown, checked against live ACP options when available.
 
-`harness_info` answers **purely from the configuration file** (it starts no daemon and no
-harness) and is the place to discover what a harness entry can actually do:
+## Message execution and errors
 
-- `permission_modes` — the modes the built-in adapter routes with the **current** config.
-  CodeBuddy and Codex route all of `read`/`edit`/`auto`/`yolo`; Agy always routes `auto`
-  (harness default) and `yolo` (defaults to `yolo`), and adds `read`/`edit` only when their
-  `launch.agy_<mode>_mode_id` is configured. A configured entry without a built-in adapter
-  reports none, rather than assuming any.
-- `models[].thinking_levels` — the declared levels for that model, or `null` when the config
-  does not declare them. The bridge never guesses a level: `null` means unknown, and
-  validation falls back to the harness's live ACP config options. An empty list means the model
-  was declared to support none.
+A session has at most one nonterminal message. Another send or option change returns `busy`;
+there is no server-side message backlog or implicit steering. The caller implements steering
+by awaiting `cancel_message`, then issuing `send_message`.
 
-`create_session` and `set_model` enforce the same declaration, so `harness_info` is an exact
-preview of what those calls will accept (see [Launching a session](#launching-a-session)).
+Message states are `running`, `waiting_input`, `cancelling`, `completed`, `failed`, `cancelled`.
+A terminal result contains `text`, `reasoning`, `tool_calls`, `stop_reason`, and `raw_result`.
+Reasoning is limited to what the harness actually emits.
 
-### `send_message` one message at a time
+An optional idempotency key replays the original message ID for the same text within a live
+session, and rejects reuse with different text. Its hash and identity are persisted in
+`queue.json`; it never creates a second message while the original is running.
 
-A session runs **at most one non-terminal message** (`queued`, `running`, or
-`waiting_input`). While one is in flight, any `send_message` that would create a new message is
-rejected with `busy` — it performs **no** steering, queueing, cancellation, or persistence, so
-a running turn is never disturbed and no half-record is written. Once the message reaches a
-terminal state (`completed`, `failed`, `cancelled`) the next submission is accepted.
+An oversized stdout line or unrepairable JSONL fails the active message and first sends
+`session/cancel`. The slot stays occupied until the original prompt settles. If cancellation
+times out, the session closes. Later correctly framed lines remain readable. Unknown
+notifications are recorded and reported as unsupported while subsequent events continue.
+Unsupported correlated responses fail the corresponding request and include original bytes.
 
-`mode` (`"steering"` default, `"queue"`, or the alias `"steer"`) no longer changes scheduling;
-it is recorded on the message and folded into the idempotency fingerprint, so it is preserved
-for identity and comparison but does not trade one message for another.
+Deterministic format repairs remove a leading UTF-8 BOM or ANSI escape envelope only in the
+adapter's parsing copy. A complete final JSON object without a newline is also accepted.
+The journal keeps the original bytes unchanged, including malformed text and vendor events.
 
-`cancel_message` cancels the in-flight message (running or waiting for an answer). `set_model`
-is likewise rejected with `busy` while a message is non-terminal; it never queues a switch.
+Option changes occur in model/thinking/permission order. A later failure does not roll back an
+already acknowledged earlier option; the session snapshot records confirmed effective values.
+A request timeout closes the session to prevent a late reply from silently changing an idle
+session. All deadlines are under `timeouts`; successful file writes allow forwarding without
+per-event `fsync`.
 
-### `send_message` idempotency
+## Live output, cursors, and SSE
 
-`idempotency_key` (optional, opaque) makes submission replay-safe within a single session. The
-key is resolved **before** the busy guard:
-
-- the **same key with the same normalized text/mode** returns the original `message_id` — even
-  while that message is still non-terminal — so a client that retries after a timeout cannot
-  submit a duplicate;
-- the **same key with different text or mode** fails with `idempotency_conflict` (the error
-  names the original `message_id`), so a key can never silently alias two different prompts;
-- a **new key** (or **no key**) while the session is busy fails with `busy`, and **omitting
-  the key** on an idle session behaves as before (a resend is a new message).
-
-`mode` is normalized before comparison, so `"steer"` and `"steering"` are the same request.
-The index is scoped to one session and committed **inside `queue.json`**, in the same atomic
-snapshot as the message it names (one temp-file + rename), so a message and its key mapping
-can never disagree after a crash. A retried key resolves to its original message even after
-`close_session` or a daemon restart, while the same key in a different session is
-independent. Only keys that are actually used are stored, hashed (SHA-256), so the snapshot
-holds no prompt text or raw key. The index is staged and the whole submission (message +
-mapping) is committed *before* any harness side effect: if that write fails the submission is
-rolled back and the error propagates, so the caller never sees a success that was not
-persisted.
-
-### Launching a session
-
-Optional `thinking_level` sets the selected model's reasoning intensity. `create_session`
-applies it during creation **after** model selection; `set_model` applies it to the **new**
-model after switching (omit it on `set_model` to change only the model). The bridge maps it to
-the harness ACP config option: `thought_level` (codebuddy), `reasoning_effort` (codex), or
-`thinking_level` (agy). Two checks apply, and the bridge never silently ignores a requested
-level:
-
-1. **Config declaration.** If the target model lists `thinking_levels`, only those levels are
-   accepted (`harness_info` reports them). A model that omits the key is *unknown*: no level is
-   assumed, and only check 2 applies. An empty list accepts no level.
-2. **Live ACP options.** When the harness advertises model-specific config options, an
-   unsupported level is rejected; otherwise the harness validates the request. Because
-   model selection drops the previous model's options and caches refreshed response options,
-   `set_model` always checks against the **new** model's advertised options.
-
-On `set_model` the declared-level check runs **before** switching, so an undeclared level
-leaves the model unchanged; a level rejected only by the new model's live options surfaces as
-an error after the switch. Agy's Gemini 2.x models cannot apply this setting and reject it
-explicitly. Omitting `thinking_level` behaves differently per tool: on `create_session` it
-keeps the harness default; on `set_model` the bridge does **not** re-apply a reasoning
-level. The harness may adjust the current level if the new model does not support it.
-
-#### Codex model IDs and executable selection
-
-Configure and pass base model IDs (for example `gpt-5-codex`) and a separate
-`thinking_level` (`low`, `medium`, `high`, or `xhigh`, **if supported by that model**).
-The Codex adapter selects `model` via `session/set_config_option`; reasoning suffixes
-are not required in the configuration. Advertised legacy `model[effort]` variants are
-collapsed to base IDs in `harness_models`. Explicit bracketed IDs remain backward compatible.
-For older ACP servers without a model option, the adapter converts a base ID internally
-using the **observed current effort**. If the effort is unknown, it fails rather than inventing
-a default. Only a method-not-found error triggers fallback; invalid models, authentication
-failures and timeouts are never retried through a different selector. The harness may adjust
-an unsupported effort when selecting a new model; an explicit `thinking_level` is applied
-and validated after the switch.
-
-A successful setter or a `ready` session alone is not proof of the effective settings.
-For verification, inspect the harness's returned `configOptions`/`session/update`
-`currentValue` for `model` and the reasoning option. If no readback is provided, the request
-is accepted but the final value remains unconfirmed. This verifies session configuration,
-not which model an upstream provider actually runs during generation.
-
-`codex-acp` can bundle its own Codex CLI. To use a specific installed version, set
-`harnesses.codex.env.CODEX_PATH` to its absolute executable path. This is per-harness
-configuration, not a global environment change. MCP clients may omit arbitrary shell
-variables, so do not rely on a shell-only `CODEX_PATH` reaching the harness.
-
-`permission_mode` accepts `read`, `edit`, `auto`, or `yolo` (default: `auto`). Routing is per
-adapter: CodeBuddy maps the mode to `--permission-mode` on argv (it also receives `--model`
-on argv, so the model is not re-set over ACP); Codex sends `session/set_config_option` with
-`configId: "mode"`; Agy sends `session/set_mode` with the configured
-`launch.agy_<mode>_mode_id` (`yolo` defaults to `yolo`; `auto` is skipped when unset).
-
-`yolo` disables normal approval prompts where supported and maps to a harness-native mode:
-
-| Harness | Native YOLO permission/mode |
-| --- | --- |
-| CodeBuddy | `bypassPermissions` |
-| Codex ACP | `agent-full-access` |
-| Antigravity ACP | `yolo` |
-
-Agy's `launch.agy_yolo_mode_id` overrides its default mode id if needed. The former
-`permission_mode: "bypass"` and `launch.agy_bypass_mode_id` are no longer accepted; rename
-them to `yolo` and `agy_yolo_mode_id` respectively. YOLO grants broad tool execution
-permissions: use it only in a trusted, isolated environment. Sources:
-[CodeBuddy permissions](https://www.codebuddy.ai/docs/cli/permissions),
-[Codex ACP modes](https://github.com/agentclientprotocol/codex-acp),
-[Antigravity ACP mode mapping](https://github.com/tiezbro/paseo-agy-acp).
-
-`create_session` covers the reference daemon's launch matrix:
-
-| | `runtime: "direct"` | `runtime: "docker"` |
-| --- | --- | --- |
-| `target: "local"` | harness argv spawned locally | `docker run --detach --init --name …` then `docker exec -i --workdir <cwd> <name> <harness argv>` |
-| `target: "remote"` | `ssh -- <host> '<wrapper running the harness>'` | the same, with the `docker exec` line inside the remote wrapper |
-
-- **Docker options**: `docker_image` (new container), `docker_id` (full 64-hex id of an
-  existing container to reuse), `container_policy` (`remove`/`keep`), `mounts`
-  (`source`/`target`/`read_only`, bind-only), `ports` (`host_port`/`container_port`/
-  `protocol`/`host_ip`), and `host_network`. `cwd` is a **container** path for docker and
-  must be absolute; it is never bind-mounted. The container working directory is created with
-  `docker exec … mkdir -p` (best effort) so `--workdir` can succeed.
-- **Reused containers**: `docker start` is used instead of `docker run`, the container's real
-  image, mounts, ports, and network are read back with a projected `docker inspect` (not
-  guessed), and the default policy becomes `keep`. Supplying new-container options together
-  with `docker_id` is rejected instead of silently ignored.
-- **Kept container id**: with `container_policy: "keep"`, `create_session` adds a top-level
-  `docker_id` — the container's real full 64-hex id, read from the supervisor's metadata —
-  so the caller can persist it and `reuse` the container in a later session. A `keep`
-  container is only **stopped** on close, never removed, so the id stays valid. A `remove`
-  container reports no top-level `docker_id`, and a kept container whose id cannot be
-  determined fails the create explicitly instead of returning a bogus reuse handle.
-- **Remote**: the generated wrapper runs the harness in the background (`set -m`), records
-  `pid`/`pgid` in a remote pid file, and on exit kills the whole remote process group and
-  removes the pid file; the bridge also runs an explicit remote cleanup with the same
-  timeout.
-- **Cleanup policy**: the per-session supervisor owns cleanup. A session that prepared its
-  container applies `container_policy` (`stop -t 0` for `keep`, `rm -f` for `remove`); a
-  container whose preparation never completed is force-removed only when this session was
-  creating it, and left untouched when it was reused — so a failed or killed launch can never
-  delete the caller's reused container. Cleanup runs **exactly once** per session (the
-  supervisor's idempotent `cleanup`), reaps an in-flight `docker run`/`start` first, terminates
-  the harness process group, then releases the container/remote resources.
-- **Process groups**: the supervisor spawns the harness (local, `docker exec`, or the `ssh`
-  wrapper) as its own session leader, so terminating a session kills the harness's entire
-  process group — and because the supervisor is a separate process in its own session, a
-  SIGKILLed daemon cannot orphan it.
-- `launch_info` in the create result echoes `target`, `runtime`, `permission_mode`, `cwd`,
-  `remote_host`, `supervisor_pid`, `transport_pid`/`transport_pgid`, `remote_pid_file`, and
-  for docker the container name, image, mounts, ports, and `host_network`.
-
-**Authentication probing**: after `initialize`, a harness that advertises auth methods is
-probed — the base adapters call `authentication/status`, CodeBuddy calls
-`_codebuddy.ai/getUserInfo` — and a session that is not logged in is returned as
-`authentication_required`, with `authenticate` completing the login. Account objects are
-rebuilt from a display whitelist, so a harness token can never reach a result. A probe with
-no reliable indicator is treated as "not authenticated" rather than guessed. `auth_info`
-re-probes and returns the **latest** whitelisted account; a probe can only confirm a login,
-never revoke an already-ready session.
-
-**Authentication limits** are enforced by one coordinator for every path, including the
-`create_session` `authenticate` convenience parameter (which therefore cannot bypass them):
-
-- a persistent **per-target attempt ledger** (`min_interval_seconds`, `max_attempts`,
-  `window_seconds`) keyed by an opaque SHA-256 hash of `harness + launch mode + ssh host`,
-  so a limit survives a daemon restart; the JSON file is written atomically with mode 0600
-  and holds only hashes and timestamps. Disabling `rate_limit` skips the file entirely;
-- **same-target serialization**: a second session on a busy target gets
-  `authentication_in_progress` (`poll_after_seconds`), and repeated `authenticate` calls on
-  one session coalesce into a single credential write;
-- **`max_concurrent_targets`** bounds how many distinct targets authenticate at once;
-- on **`authentication.timeout_seconds`** the session is closed and its container/remote
-  resources released per policy, returning `authentication_timed_out`.
-
-### Polling
-
-`send_message` returns only the id, and a session has at most one message in flight. Poll with:
-
-```
-message_result { session_id, message_id? }   -> status; text/tool_calls only once terminal
-live_output    { session_id, message_id?, offset?, max_bytes?, stop? }
+```json
+{ "session_id": "<session>", "message_id": "<message>", "limit": 100, "wait_ms": 15000 }
 ```
 
-With `message_id` you get the full status (`state`, `terminal`, pending `interaction`,
-`queue_position`, `error`); `text`, `tool_calls`, and `harness_session_id` appear **only once
-the message is terminal**, so a non-terminal poll can never be mistaken for a final answer
-(use `live_output` for the partial preview). Without `message_id` you get whole-session status.
+The response data contains `events`, `next_cursor`, `has_more`, `session_closed`, and `terminal`.
+Pass `next_cursor` unchanged as the next request's `cursor`. Cursors bind to the session and
+optional message filter; changing either invalidates the cursor. They contain the raw-file
+byte position and position within a rendered event, and survive process restarts.
 
-Terminal states are `completed`, `failed`, and `cancelled`, and `message_result` carries an
-explicit `terminal` boolean. `waiting_input` means an **interaction** request is pending and
-must be answered with `answer_question`. A harness permission and information request are
-unified into the same interaction object; only `interaction.permission` tells them apart, and
-it is `true` for a permission request and `false` for an information request.
+`limit` counts returned event fragments, from 1 to `buffers.preview_page_events`.
+Large text is split at UTF-8 boundaries according to `buffers.preview_text_bytes`;
+`complete: false` means the same event continues on the next fragment. Join matching
+`seq`/`type` text fragments in order. The cursor also handles multiple rendered events
+from a single tool record. Polling never loses older output to preview-window eviction.
 
-`answer_question` takes `answer: "accept" | "reject" | "timeout" | "cancel"` (default
-`"accept"`). `accept` carries the concrete `response` (`{ option_id }` for permission, the
-answer object for information). The non-accept answers carry no payload; they differ in
-intent and are routed to the ACP outcome that matches the interaction type:
+`wait_ms` ranges from 0 to 60000. At EOF a live session can wait for an append, disconnect,
+or deadline. Always drain `has_more`, even when `terminal` is true. Without `message_id`,
+`terminal` means session closure; with it, it means message completion.
 
-| `answer` | permission interaction | information interaction |
-| --- | --- | --- |
-| `accept` | `{ outcome: { outcome: "selected", optionId } }` (validated) | `{ content }` (or `{ action: "accept", content }` for elicitation) |
-| `reject` | offered reject/deny option when present, else `{ outcome: { outcome: "cancelled" } }` | no protocol decline exists → the turn is cancelled (`cancel_reason: "rejected"`) |
-| `timeout` | `{ outcome: { outcome: "cancelled" } }` | elicitation → `{ action: "cancel" }`; plain information → the turn is cancelled (`cancel_reason: "interaction_timeout"`) |
-| `cancel` | `{ outcome: { outcome: "cancelled" } }` (never a deny option) | elicitation → `{ action: "cancel" }`; plain information → the turn is cancelled (`cancel_reason: "user_cancel"`) |
+To stream, POST the same JSON with **`Accept: text/event-stream`**. Each `event: output`
+contains a JSON `{ "ok": true, "data": <page> }` envelope and its next cursor as the SSE
+`id`. Reconnect by POSTing that cursor in the body. Use a POST-capable streaming client
+such as fetch; browser `EventSource` only supports GET. The stream ends after terminal
+output is drained, or on disconnect. Errors after stream headers use `event: error` with
+a JSON error envelope; earlier errors remain ordinary JSON HTTP responses.
 
-`reject` is a "soft no": for a permission it selects an offered deny option when one exists,
-leaving the harness free to continue. `timeout` is an implicit non-answer (no decision was
-made in time), and `cancel` is an explicit caller withdrawal — it never picks a deny option
-and, for an elicitation, tells the harness the whole request was withdrawn. A
-`reject`/`timeout`/`cancel` that the harness still accepts leaves the message running; when
-the harness reports a cancellation the message becomes `cancelled`. Answers from a closed or
-restarted session carry additional flags (`persisted`, `orphaned`);
-see [Reading a closed or restarted session](#reading-a-closed-or-restarted-session).
+## Session files
 
-### Failure classification
-
-A message never "partially succeeds": a protocol or limit failure **fails** the message,
-discards its final `text`/`tool_calls`, and reports status plus a machine-readable
-`error.code` and a redacted `error.message`. The raw harness stream is never returned; any
-already-streamed output remains available as a diagnostic preview through `live_output`.
-
-| `error.code` | Meaning |
-| --- | --- |
-| `invalid_json` | A stdout line was not valid JSON. |
-| `malformed_message` | Valid JSON, but not a recognized JSON-RPC response/request/`session/update`, a non-object frame, or a response to an id the bridge never sent. |
-| `line_too_large` | A single stdout line exceeded `buffers.max_read_bytes`. |
-| `output_limit` | The stream exceeded the bounded discard budget (one line far over the limit, or a flood of oversized lines). |
-| `output_timeout` | No harness response arrived within `transport.turn_timeout_seconds` (or the startup handshake within `startup_timeout_seconds`). |
-| `transport` | The harness process/stdin failed, the transport closed mid-turn, or the connection was unavailable. |
-| `acp_rpc_error` | The harness returned a JSON-RPC error for a request. |
-| `interrupted` | A daemon restart orphaned the message (see below). |
-
-`invalid_json`, `malformed_message`, `line_too_large`, `output_limit`, and `output_timeout`
-close the transport, so a follow-up submission on the same session fails fast with `transport`
-rather than dangling; close the session and create a new one.
-
-### `live_output` semantics
-
-- `offset` is an **absolute byte offset** into the session preview stream. Omit it to start
-  at the message's own output window.
-- Re-pass `next_offset` on the next call to continue where you stopped.
-- `truncated: true` means the requested offset fell behind the retained rolling window;
-  the read is clamped forward and `dropped_bytes` reports the gap, so a poller can
-  resynchronize instead of silently losing data.
-- `stopped: true` means no further output can arrive (the message is terminal and all of
-  its output was delivered, or the session is closed). `stop: true` stops immediately.
-- `wait_ms` (max 30000) turns the call into a **long-poll**: it listens on the preview file
-  via `fs.watch` (with a short interval fallback) and returns as soon as new output arrives
-  or the message settles, so a client does not have to busy-poll. `waited_ms` reports how
-  long it waited. The in-place truncation the rolling window performs is handled, watchers
-  are always cleaned up, and a client disconnect aborts the wait.
-- Offsets are byte-based, so a chunk boundary may split a multi-byte UTF-8 character.
-
-### Completion notifications
-
-MCP has no reliable server-initiated callback for "this background turn finished". The
-bridge does **not** invent one. It advertises the standard `logging` server capability
-during initialize and then emits a best-effort `notifications/message` logging notification
-(`data.event: "message_complete"`) when a submitted message reaches a terminal state.
-Clients may ignore or throttle notifications, so **polling is always the authoritative
-path** and is never disabled.
-
-## Persistence layout
-
-```
-~/.harness-acp-bridge/<YYYY-MM-DD>-<random>/
-  raw.jsonl     append-only, redacted raw ACP traffic (client requests + stdout + stderr)
-  log.txt       append-only human-readable lifecycle log
-  preview.txt   size-capped rolling preview, appended incrementally (tail-able)
-  state.json    atomic session-state snapshot
-  queue.json    atomic queue / per-message state snapshot, including the hashed
-                send_message idempotency index (committed with the message)
-  results/      atomic per-message result snapshots (<message_id>.json)
-  meta.json     atomic session metadata: creation params + effective echo, redacted
+```text
+<session_dir>/<session_id>/
+  raw.jsonl
+  session.json
+  queue.json
+  results/<message_id>.json
 ```
 
-Snapshots are written with a temp file + `rename`, so a reader (or a restarted process)
-never sees a half-written file. `state.json`, `queue.json`, and `results/*.json` are
-sufficient to read a closed session's status and results after a restart, and `queue.json`
-alone carries the idempotency index. (An earlier layout's standalone `idempotency.json` is
-still read as a fallback but is no longer written.)
+`raw.jsonl` is append-only and combines lifecycle events and all original stdin/stdout/stderr
+traffic. Each record has `version`, `seq`, `timestamp`, `session_id`, and `message_id`.
+Transport records also have `stream`, `encoding: "base64"`, and `raw`; base64 preserves
+exact bytes, whitespace, CRLF, invalid JSON, and non-UTF-8 protocol output. Oversized
+stdout is split into records with `fragment: true`, preserving received bytes in order.
+Lifecycle records have `event` and `data`. Raw records are not redacted or reserialized.
 
-### Reading a closed or restarted session
+`session.json` combines metadata, state, and effective options. `queue.json` stores the
+single active message, compact message states, and idempotency mappings. Results are
+stored separately. Snapshots use atomic temporary-file/rename writes. Session directories
+use mode 0700 and files 0600. The optional server-wide auth ledger and process lock live
+outside individual session directories; supervisor metadata is temporary and removed on close.
 
-`message_result` and `live_output` keep working for a session that is no longer live:
+After a restart, old session history remains readable and live sessions become `interrupted`.
+An in-flight message becomes failed with `session_interrupted`; already committed terminal
+results survive a stale queue snapshot. Recovery drops a crash's incomplete journal tail
+before appending the recovery event. There is no automatic process reattachment.
 
-- **After `close_session`** the session leaves the live registry, and both calls are served
-  read-only from the session directory (`state.json` + `queue.json` + `results/`). The answers
-  carry `persisted: true`.
-- **After a daemon restart** the in-flight message that the previous run left behind is
-  reconciled exactly once into the terminal state `failed` with `error.code:
-  "interrupted"`, `orphaned: true`, and the session state becomes `interrupted`. This is
-  written back to disk, so a message can never stay non-terminal forever and the answer is
-  stable on every later read. The partial output the turn had produced is still readable
-  through `live_output`.
+## Validation
 
-The recovery path is deliberately narrow: the session id must be a single path segment, the
-directory must resolve under the configured `paths.session_dir`, and it must be a real
-directory (not a symlink) whose realpath is exactly `<session_root>/<session_id>`. Snapshot
-and preview files are only read when they are regular, non-symlinked files. Session ids are
-never trusted as paths.
-
-`send_message` to a non-live session is rejected with `unknown_session`, **except** when an
-`idempotency_key` is supplied that was already used in that session: the response is then the
-original `message_id` (a safe retry), and a mismatched text/mode is `idempotency_conflict`.
-This is what makes a retried submit safe across `close_session` and a daemon restart.
-
-`create_session` never writes into or through an existing path: an explicit `session_id`
-that already exists is rejected with `session_exists`, and a failed creation removes only
-the directory that call created.
-
-## Security
-
-- The daemon listens on a **Unix socket only** (no TCP), created with mode `0600` inside a
-  `0700` directory, so only the owning user can reach it.
-- A PID lock file (`0600`) with stale-lock takeover plus the socket bind enforce a single
-  daemon per socket.
-- Callers choose *where* and *how* a harness runs, but only through a validated allow-list.
-  Rejected outright (`launch_internal`): `command`, `args`, `env`, `ssh_command`, `ssh_args`,
-  `ssh_host`, `launch_mode`, `docker_command`, `entrypoint`, `base_dir`, `session_dir`,
-  `state_dir`, `max_read_bytes`, `max_output_bytes`, and the other launch internals — those
-  come from the configuration file only. Accepted and strictly validated: `target`,
-  `remote_host`, `runtime`, `docker_id` (full 64-hex), `docker_image`, `container_policy`,
-  `mounts`, `ports`, and `host_network`; a reused `docker_id` rejects new-container options
-  instead of silently ignoring them, and `cwd` is never bind-mounted.
-- Each session is run by its own **supervisor process**, spawned in a separate session. The
-  daemon never spawns the harness directly, so a SIGKILLed or crashed daemon cannot orphan the
-  harness: the supervisor detects the loss (its pipe reaches EOF, its parent changes, or the
-  daemon pid is gone), terminates the harness process group (`SIGTERM` → grace → `SIGKILL`),
-  and releases the container/remote per policy — force-removing a container it may have
-  half-created and leaving a caller-owned reused container untouched.
-- Session directories are claimed with an exclusive atomic `mkdir` (no check-then-create
-  race), so two concurrent `create_session` calls with the same `session_id` cannot share a
-  directory, and a failed create only removes the directory it claimed.
-- Every persisted record, the raw stream, the stderr tail, and the session metadata pass
-  through key-based and text-based credential redaction. Account objects are rebuilt from a
-  display whitelist, so harness tokens never reach a result or the disk.
-- Session directories are `0700`, files `0600`.
-- Bounds: IPC request/response lines (16 MiB), a single prompt (1 MiB), a single ACP line
-  (`buffers.max_read_bytes`), and `live_output` chunks (default 64 KiB, max 1 MiB). A violation
-  of the ACP output bounds **fails the message** (`line_too_large`/`output_limit`) instead of
-  being skipped, and the raw stream is never returned to a caller.
-- Credentials are never accepted over IPC; authentication is delegated to the harness
-  through ACP `authenticate`.
-- The authentication attempt ledger holds only SHA-256 target hashes and timestamps, is
-  written atomically (temp file + `rename`) with mode `0600`, and is serialized within the
-  single writer daemon.
-
-## Publishing (maintainers)
-
-```bash
-npm ci
+```sh
 npm run check
-npm pack --dry-run              # review the file list; prepack rebuilds dist/
-npm audit --omit=dev
-npm login --registry=https://registry.npmjs.org/
-npm whoami --registry=https://registry.npmjs.org/   # account must own the @black942026 scope
-npm publish --access public     # prepublishOnly runs check; prepack rebuilds dist/
 ```
 
-Review the tarball before publishing: it should contain only `dist/`, `package.json`,
-`config.example.yaml`, `README.md`, and `LICENSE`. Never include local configs, credentials,
-session state, or `node_modules/`. Publishing requires the scope's permissions and npm's
-current authentication/2FA requirements. The default version is `0.1.0`, a non-prerelease
-version; choose `1.0.0` only when you intend to commit to a stable compatibility contract.
-For later releases, use `npm version patch|minor|major` from a clean working tree to update
-both manifests; MCP/ACP handshake versions follow `package.json` automatically. Run the
-checks again for the new version, push the commit/tag, then publish. Never reuse a published
-version. GitHub Actions CI on Linux/macOS and a real harness smoke test are recommended
-before the first release (the e2e suite below uses mocks).
-
-## Not implemented (honest limitations)
-
-- **Cross-process ledger coordination** — the reference used SQLite so several processes
-  could share one ledger atomically. This port uses a JSON file guarded by an in-process
-  mutex, which is correct for the single-writer daemon (the socket+lock guarantee one daemon
-  per config), but two daemons pointed at the same `ledger_path` could race. Use distinct
-  `ledger_path` values if you intentionally run parallel daemons.
-- **Escaped processes** — the supervisor reaps the harness process group it created, which
-  covers a harness and its children for local, `docker exec`, and `ssh` launches. It cannot
-  account for a process the harness deliberately detaches into a new session/process group
-  (`setsid`, daemonizing, `--bg`), for work already handed to a real remote host or container
-  that ignores the kill, or for the case where the supervisor itself is SIGKILLed before its
-  cleanup runs (the daemon's close path closes stdin first and only escalates to `SIGKILL`
-  after the grace budget, so the normal and daemon-crash paths both clean up).
-- **No real remote / Docker / account testing** — the end-to-end suite drives mock `docker`
-  and `ssh` CLIs plus a fake ACP harness, so the constructed argv, lifecycle, cleanup,
-  mode routing, and auth probing are verified, but no real container, SSH host, or vendor
-  account was exercised. Docker-specific behaviours that only a real engine exhibits (image
-  pulls, port conflicts, `--init` semantics, inspect field differences) are therefore
-  unverified.
-- **Container reuse discovery** — the bridge does not list or discover containers, and it
-  does not remember them between runs. A `keep` container does hand its id back at the
-  `create_session` top level (see [Launching a session](#launching-a-session)) so a caller can
-  persist and reuse it, but that id is the caller's to keep; `launch_info` for a reused
-  container reflects only the projected inspect fields (image, bind mounts, ports, network
-  mode).
-- **`resume_session_id`** is passed through as `session/load`; whether a harness can actually
-  resume is harness-specific and not validated.
-- **MCP resource/prompt surfaces** and harness `fs`/`terminal` ACP client capabilities are not
-  implemented (the transport advertises them as unsupported).
-- **ACP elicitation** is supported in **form mode only**, declared as
-  `clientCapabilities.elicitation = { form: {} }` during `initialize` and relayed through the
-  `answer_question` interaction (`accept` with content, or `decline`/`cancel`). A form is the
-  in-connection structured form the bridge can safely relay; **URL mode is not supported and is
-  deliberately never advertised**, because a URL elicitation is an out-of-band browser
-  authorization whose credentials must not pass through ACP or the bridge. A harness that
-  requests `mode: "url"` gets JSON-RPC `-32602` rather than a false acceptance, and a mode-less
-  request is treated as the MCP-style form default for compatibility. The bridge does **not**
-  expose MCP's own elicitation capability to its MCP client; it relays ACP elicitation through
-  `answer_question` instead. Any other unrecognized JSON-RPC notification (for example
-  `elicitation/complete`, which only URL mode would need) fails the message as
-  `malformed_message`.
-- **Supported vendor notifications** — a small, closed set of Codex/CodeBuddy
-  out-of-band notifications is accepted as **advisory observations only**:
-  `_auth/status_update`, `_codebuddy.ai/authUrl`, `_codebuddy.ai/command`, and
-  `_codebuddy.ai/checkpoint`. They are type-checked (JSON-RPC 2.0, no `id`, valid `params`),
-  emitted redacted, and never drive bridge/session/turn state: they are not RPC responses,
-  proof of login, permission approvals, commands to execute, rollbacks, or turn-completion
-  signals, and they are not folded into `text`/`tool_calls`. In particular
-  `_codebuddy.ai/checkpoint` (`event: created`/`updated`/`reverted` with a
-  `checkpoint` summary) is only observed — the bridge never replays or reverts it. An
-  id-bearing frame for any of these methods is a normal reverse request (answered
-  `-32601`), and any other notification method still fails as `malformed_message`; the
-  bridge never accepts `_codebuddy.ai/*` indiscriminately.
-- **Live turn resumption after a daemon restart** — a restarted daemon (or a closed
-  session) can *read* the previous run's state, results, and preview, and reconciles
-  in-flight messages to a terminal `failed` / `orphaned` state, but it cannot resume the
-  turn: the harness process is gone and no new turn is started for it.
-- **Platform** — modes/kill semantics assume POSIX (`0600` sockets, `killpg`, the remote
-  wrapper's `ps -o pgid=`). macOS and Linux are the supported platforms; Windows is not
-  supported.
+Tests exercise built HTTP endpoints, real supervisor/child processes with a fake ACP harness,
+wire preservation, session state transitions, reverse questions, deadlines, journal recovery,
+UTF-8 cursor pagination, and SSE. Docker/SSH launch tests use local shims, not a real host,
+container engine, or paid model. The server's old Unix-socket clients in sibling projects
+require a separate HTTP migration.

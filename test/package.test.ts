@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-import { CLIENT_VERSION } from "../src/acp";
+import { CLIENT_VERSION } from "../src/adapter/protocol";
 
 const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 const lock = JSON.parse(readFileSync(new URL("../package-lock.json", import.meta.url), "utf8"));
@@ -17,19 +17,13 @@ describe("npm release metadata", () => {
     expect(lock.packages[""].version).toBe(manifest.version);
   });
 
-  it("uses the package version in MCP and ACP handshakes", () => {
+  it("uses the package version in ACP handshakes", () => {
     expect(CLIENT_VERSION).toBe(manifest.version);
   });
 
-  it("keeps both executable entrypoints shebang-enabled", () => {
-    expect(manifest.bin).toEqual({
-      "harness-acp-bridge": "dist/cli.js",
-      "harness-acp-bridge-daemon": "dist/daemon/main.js",
-    });
-    for (const entry of Object.values(manifest.bin) as string[]) {
-      const source = entry.replace(/^dist\//, "src/").replace(/\.js$/, ".ts");
-      expect(readFileSync(new URL(`../${source}`, import.meta.url), "utf8"))
-        .toMatch(/^#!\/usr\/bin\/env node\n/);
-    }
+  it("publishes only server entrypoints, without CLI executables or an MCP dependency", () => {
+    expect(manifest.bin).toBeUndefined();
+    expect(manifest.exports).toEqual({ ".": "./dist/index.js" });
+    expect(manifest.dependencies["@modelcontextprotocol/sdk"]).toBeUndefined();
   });
 });

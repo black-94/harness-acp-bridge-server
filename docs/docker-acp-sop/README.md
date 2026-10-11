@@ -1,3 +1,5 @@
+> 历史操作记录：本文中的 Unix socket、旧工具名和 bridge-call 脚本已停用。当前 HTTP 接口、启动方法与文件格式请参阅 [server README](../../README.md)。远程部署步骤仅作历史参考。
+
 # SOP：远程 Docker 隔离工作副本，通过 ACP 委派 CodeBuddy 检查和测试
 
 > 根据本次完整操作整理。命令区分「本地协调端」「远程宿主机」「容器」「ACP 工具调用」。

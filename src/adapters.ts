@@ -5,7 +5,7 @@
  * routing, and authentication status probing. A caller can never influence the command line
  * or environment beyond what the adapter and the config file decide.
  */
-import { publicAccount } from "./persistence.js";
+import { publicAccount } from "./privacy.js";
 
 export type HarnessName = "codebuddy" | "codex" | "agy";
 export type LaunchMode = "local" | "ssh";
@@ -20,6 +20,7 @@ export class AdapterError extends Error {
 /** Raised when a harness has no reliable auth-status endpoint. */
 export class AuthStatusUnsupported extends Error {
   override name = "AuthStatusUnsupported";
+  constructor(message: string, readonly detail?: unknown) { super(message); }
 }
 
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -87,6 +88,7 @@ export interface HarnessAdapter {
   setModel(client: AdapterClient, modelId: string): Promise<Record<string, unknown>>;
   /** Harness-specific permission-mode routing; default is a no-op. */
   setMode(client: AdapterClient, config: AdapterConfig, sessionId: string): Promise<void>;
+  setPermissionMode(client: AdapterClient, config: AdapterConfig, sessionId: string): Promise<void>;
   /** Apply the requested reasoning level for the selected model (never silently ignore it). */
   setThinkingLevel(
     client: AdapterClient,
@@ -154,7 +156,7 @@ abstract class BaseAdapter implements HarnessAdapter {
     try {
       response = await client.request("authentication/status", {});
     } catch (error) {
-      if (rpcCode(error) === -32601) throw new AuthStatusUnsupported("authentication/status unsupported");
+      if (rpcCode(error) === -32601) throw new AuthStatusUnsupported("authentication/status unsupported", (error as { detail?: unknown }).detail);
       throw error;
     }
     return normalizeAuthStatus(response, methods);
@@ -171,6 +173,10 @@ abstract class BaseAdapter implements HarnessAdapter {
 
   async setMode(_client: AdapterClient, _config: AdapterConfig, _sessionId: string): Promise<void> {
     // Most harnesses fix their mode at launch; only Codex and Agy need a round trip.
+  }
+
+  async setPermissionMode(client: AdapterClient, config: AdapterConfig, sessionId: string): Promise<void> {
+    await this.setMode(client, config, sessionId);
   }
 
   async setThinkingLevel(
@@ -207,6 +213,10 @@ abstract class BaseAdapter implements HarnessAdapter {
 export class CodeBuddyAdapter extends BaseAdapter {
   readonly name: HarnessName = "codebuddy";
 
+  override async setPermissionMode(client: AdapterClient, config: AdapterConfig, sessionId: string): Promise<void> {
+    await client.request("session/set_mode", { sessionId, modeId: CODEBUDDY_MODE_FLAGS[config.permissionMode] });
+  }
+
   override validate(config: AdapterConfig): void {
     super.validate(config);
     for (const value of config.args) {
@@ -237,12 +247,15 @@ export class CodeBuddyAdapter extends BaseAdapter {
     client: AdapterClient,
     initializeResponse: Record<string, unknown>,
   ): Promise<AuthInfo> {
+    // Prefer the common ACP extension, and use the vendor endpoint only when absent.
+    try { return await super.getAuthInfo(client, initializeResponse); }
+    catch (error) { if (!(error instanceof AuthStatusUnsupported)) throw error; }
     const methods = authMethods(initializeResponse);
     let response: Record<string, unknown>;
     try {
       response = await client.request("_codebuddy.ai/getUserInfo", {});
     } catch (error) {
-      if (rpcCode(error) === -32601) throw new AuthStatusUnsupported("getUserInfo unsupported");
+      if (rpcCode(error) === -32601) throw new AuthStatusUnsupported("getUserInfo unsupported", (error as { detail?: unknown }).detail);
       throw error;
     }
     const result = isRecord(response.result) ? response.result : {};
@@ -407,14 +420,16 @@ export function normalizeAuthStatus(
   let authenticated: boolean;
   if (typeof explicit === "boolean") {
     authenticated = explicit;
-  } else if (kind) {
-    authenticated = !["none", "unauthenticated", "auth_required", "unknown"].includes(kind);
+  } else if (["api-key", "chat-gpt", "gateway", "authenticated"].includes(kind)) {
+    authenticated = true;
+  } else if (["none", "unauthenticated", "auth_required", "auth-required"].includes(kind)) {
+    authenticated = false;
   } else if (["api-key", "chat-gpt", "gateway"].includes(statusType)) {
     authenticated = true;
-  } else if (["none", "unauthenticated", "auth-required", "unknown"].includes(statusType)) {
+  } else if (["none", "unauthenticated", "auth-required"].includes(statusType)) {
     authenticated = false;
   } else {
-    throw new AuthStatusUnsupported("authentication status has no reliable login indicator");
+    throw new AuthStatusUnsupported("authentication status has no reliable login indicator", candidate);
   }
   let account = isRecord(candidate.account) ? candidate.account : null;
   if (!account && typeof candidate.email === "string") account = { email: candidate.email };

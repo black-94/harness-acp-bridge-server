@@ -1,12 +1,4 @@
-/**
- * Configuration model for the harness ACP bridge.
- *
- * Mirrors the shape of the reference Python configuration
- * (`harness_acp_mcp/config.py:load_settings`) but is scoped to what the bridge itself
- * needs: where runtime state lives, how the harness transports are bounded, and which
- * harnesses/models are exposed. Later stages (server + queue) consume the resolved
- * `BridgeConfig` and the `harness_info` declaration helper.
- */
+/** Administrator-owned HTTP, launch, session policy, and preview configuration. */
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -16,13 +8,8 @@ import { z } from "zod";
 import { supportedPermissionModes, type PermissionMode } from "./adapters.js";
 
 export const CONFIG_ENV = "HARNESS_ACP_BRIDGE_CONFIG";
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 export const SERVICE_NAME = "harness-acp-bridge";
-
-/** Overall budget for one create-session call, shared by bridge and caller. */
-export const CREATE_SESSION_TIMEOUT_PHASES = 3;
-export const CREATE_SESSION_TIMEOUT_GRACE_SECONDS = 30;
-export const CREATE_SESSION_IPC_GRACE_SECONDS = 15;
 
 export class ConfigError extends Error {
   override name = "ConfigError";
@@ -42,7 +29,7 @@ const MULTIPLIERS: Record<string, number> = {
 /** Parse `100MiB` / `128KiB` / `4096` into a byte count. */
 export function parseSize(value: string | number, label: string): number {
   if (typeof value === "number") {
-    if (!Number.isInteger(value) || value <= 0) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
       throw new ConfigError(`${label} must be a positive byte count`);
     }
     return value;
@@ -54,20 +41,10 @@ export function parseSize(value: string | number, label: string): number {
   const amount = Number(match.groups.number);
   const unit = (match.groups.unit ?? "b").toLowerCase();
   const bytes = amount * MULTIPLIERS[unit];
-  if (!Number.isFinite(bytes) || bytes <= 0) {
+  if (!Number.isSafeInteger(bytes) || bytes <= 0) {
     throw new ConfigError(`${label} must be a positive byte count`);
   }
   return bytes;
-}
-
-export function createSessionTimeoutSeconds(startupTimeoutSeconds: number): number {
-  return startupTimeoutSeconds * CREATE_SESSION_TIMEOUT_PHASES + CREATE_SESSION_TIMEOUT_GRACE_SECONDS;
-}
-
-export function runtimeDirectory(): string {
-  const configured = process.env.XDG_RUNTIME_DIR;
-  if (configured) return join(configured, SERVICE_NAME);
-  return join("/tmp", `${SERVICE_NAME}-${typeof process.getuid === "function" ? process.getuid() : 0}`);
 }
 
 /**
@@ -119,27 +96,29 @@ export interface BridgeConfig {
     sessionDir: string;
   };
   server: {
-    socketPath: string;
-    lockPath: string;
-    startTimeoutSeconds: number;
+    host: string;
+    port: number;
+    maxBodyBytes: number;
   };
   sessions: {
     maxConcurrency: number;
     idleTimeoutSeconds: number;
     reapIntervalSeconds: number;
   };
-  transport: {
+  timeouts: {
     startupTimeoutSeconds: number;
+    requestTimeoutSeconds: number;
     turnTimeoutSeconds: number;
     turnCancelTimeoutSeconds: number;
+    authenticationTimeoutSeconds: number;
+    inputTimeoutSeconds: number;
     terminateGraceSeconds: number;
     remoteCleanupTimeoutSeconds: number;
-    stderrTailLines: number;
   };
   buffers: {
     maxReadBytes: number;
-    maxOutputBytes: number;
-    previewBytes: number;
+    previewPageEvents: number;
+    previewTextBytes: number;
   };
   /** Launch plumbing: the CLI programs used to reach a harness. Never caller-supplied. */
   launch: {
@@ -152,7 +131,6 @@ export interface BridgeConfig {
   };
   authentication: {
     /** How long one `authenticate` round trip may take before the session is closed. */
-    timeoutSeconds: number;
     /** How many distinct harness+target authentications may run at once. */
     maxConcurrentTargets: number;
     /** Private ledger file holding the per-target attempt timestamps. */
@@ -212,9 +190,9 @@ const fileSchema = z
       .default({}),
     server: z
       .object({
-        socket_path: z.string().nullable().default(null),
-        lock_path: z.string().nullable().default(null),
-        start_timeout_seconds: z.number().positive().default(10),
+        host: z.string().min(1).default("127.0.0.1"),
+        port: z.number().int().min(0).max(65535).default(8787),
+        max_body_bytes: sizeValue.default("1MiB"),
       })
       .strict()
       .default({}),
@@ -226,22 +204,24 @@ const fileSchema = z
       })
       .strict()
       .default({}),
-    transport: z
+    timeouts: z
       .object({
         startup_timeout_seconds: z.number().positive().default(60),
+        request_timeout_seconds: z.number().positive().default(60),
         turn_timeout_seconds: z.number().positive().default(1800),
+        authentication_timeout_seconds: z.number().positive().default(600),
+        input_timeout_seconds: z.number().nonnegative().default(0),
         turn_cancel_timeout_seconds: z.number().positive().default(5),
         terminate_grace_seconds: z.number().positive().default(5),
         remote_cleanup_timeout_seconds: z.number().positive().default(10),
-        stderr_tail_lines: z.number().int().positive().default(200),
       })
       .strict()
       .default({}),
     buffers: z
       .object({
         max_read_bytes: sizeValue.default("100MiB"),
-        max_output_bytes: sizeValue.default("128KiB"),
-        preview_bytes: sizeValue.default("16KiB"),
+        preview_page_events: z.number().int().positive().default(200),
+        preview_text_bytes: sizeValue.default("16KiB"),
       })
       .strict()
       .default({}),
@@ -261,7 +241,6 @@ const fileSchema = z
       .default({}),
     authentication: z
       .object({
-        timeout_seconds: z.number().positive().default(600),
         max_concurrent_targets: z.number().int().positive().default(2),
         ledger_path: z.string().min(1).nullable().default(null),
         rate_limit: z
@@ -343,6 +322,9 @@ function resolveConfig(file: FileConfig, configPath: string | null): BridgeConfi
   const stateDir = resolvePath(file.paths.state_dir, defaultStateDirectory());
   // Sessions live directly under the base directory: <base>/<date>-<random>/
   const sessionDir = resolvePath(file.paths.session_dir, stateDir);
+  if (parseSize(file.buffers.preview_text_bytes, "buffers.preview_text_bytes") < 4) {
+    throw new ConfigError("buffers.preview_text_bytes must be at least 4 for UTF-8 paging");
+  }
 
   const harnesses: Record<string, HarnessConfig> = {};
   const modelIds = new Set<string>();
@@ -392,29 +374,29 @@ function resolveConfig(file: FileConfig, configPath: string | null): BridgeConfi
     configPath,
     paths: { stateDir, sessionDir },
     server: {
-      // Runtime socket/lock live in the (tmp) runtime dir, so they never mix with the
-      // session directories under the state dir.
-      socketPath: resolvePath(file.server.socket_path, join(runtimeDirectory(), "bridge.sock")),
-      lockPath: resolvePath(file.server.lock_path, join(runtimeDirectory(), "bridge.lock")),
-      startTimeoutSeconds: file.server.start_timeout_seconds,
+      host: file.server.host,
+      port: file.server.port,
+      maxBodyBytes: parseSize(file.server.max_body_bytes, "server.max_body_bytes"),
     },
     sessions: {
       maxConcurrency: file.sessions.max_concurrency,
       idleTimeoutSeconds: file.sessions.idle_timeout_seconds,
       reapIntervalSeconds: file.sessions.reap_interval_seconds,
     },
-    transport: {
-      startupTimeoutSeconds: file.transport.startup_timeout_seconds,
-      turnTimeoutSeconds: file.transport.turn_timeout_seconds,
-      turnCancelTimeoutSeconds: file.transport.turn_cancel_timeout_seconds,
-      terminateGraceSeconds: file.transport.terminate_grace_seconds,
-      remoteCleanupTimeoutSeconds: file.transport.remote_cleanup_timeout_seconds,
-      stderrTailLines: file.transport.stderr_tail_lines,
+    timeouts: {
+      startupTimeoutSeconds: file.timeouts.startup_timeout_seconds,
+      requestTimeoutSeconds: file.timeouts.request_timeout_seconds,
+      authenticationTimeoutSeconds: file.timeouts.authentication_timeout_seconds,
+      inputTimeoutSeconds: file.timeouts.input_timeout_seconds,
+      turnTimeoutSeconds: file.timeouts.turn_timeout_seconds,
+      turnCancelTimeoutSeconds: file.timeouts.turn_cancel_timeout_seconds,
+      terminateGraceSeconds: file.timeouts.terminate_grace_seconds,
+      remoteCleanupTimeoutSeconds: file.timeouts.remote_cleanup_timeout_seconds,
     },
     buffers: {
       maxReadBytes: parseSize(file.buffers.max_read_bytes, "buffers.max_read_bytes"),
-      maxOutputBytes: parseSize(file.buffers.max_output_bytes, "buffers.max_output_bytes"),
-      previewBytes: parseSize(file.buffers.preview_bytes, "buffers.preview_bytes"),
+      previewPageEvents: file.buffers.preview_page_events,
+      previewTextBytes: parseSize(file.buffers.preview_text_bytes, "buffers.preview_text_bytes"),
     },
     launch: {
       sshCommand: file.launch.ssh_command,
@@ -428,7 +410,6 @@ function resolveConfig(file: FileConfig, configPath: string | null): BridgeConfi
       },
     },
     authentication: {
-      timeoutSeconds: file.authentication.timeout_seconds,
       maxConcurrentTargets: file.authentication.max_concurrent_targets,
       // The ledger lives under the state dir by default, alongside the session dirs.
       ledgerPath: resolvePath(file.authentication.ledger_path, join(stateDir, "auth-rate.json")),
@@ -449,26 +430,11 @@ function resolveConfig(file: FileConfig, configPath: string | null): BridgeConfi
   return Object.freeze({ ...resolved, fingerprint });
 }
 
-/** Parse `--config <path>` / `--config=<path>` from a CLI argv slice. */
-export function configArgument(argv: string[]): string | undefined {
-  for (let index = 0; index < argv.length; index += 1) {
-    const value = argv[index];
-    if (value === "--config" || value?.startsWith("--config=")) {
-      const path = value === "--config" ? argv[index + 1] : value.slice("--config=".length);
-      if (!path?.trim() || (value === "--config" && path.startsWith("--"))) {
-        throw new ConfigError("--config requires a non-empty YAML file path");
-      }
-      return path;
-    }
-  }
-  return undefined;
-}
-
 /**
  * Resolve which configuration file would be used, without reading it.
  *
  * Returns `null` when neither an explicit path, the environment variable, nor the
- * default location applies. Used by the CLI so it can hand the same path to the daemon.
+ * default location applies. Used by the server entrypoint and embedders.
  */
 export function resolveConfigPath(explicitPath?: string): string | null {
   if (explicitPath) return resolve(expandHome(explicitPath));
@@ -525,7 +491,7 @@ export function declaredThinkingLevels(
   return findModel(config, harness, modelId)?.thinkingLevels ?? null;
 }
 
-/** One configured model's declaration, as reported by `harness_info`. */
+/** One configured model's declaration, as reported by `search_harness`. */
 export interface HarnessModelInfo {
   id: string;
   name: string;
@@ -533,7 +499,7 @@ export interface HarnessModelInfo {
   thinking_levels: string[] | null;
 }
 
-/** One configured harness's declaration, as reported by `harness_info`. */
+/** One configured harness's declaration, as reported by `search_harness`. */
 export interface HarnessInfo {
   name: string;
   description: string | null;
