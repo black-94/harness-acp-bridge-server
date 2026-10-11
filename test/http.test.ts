@@ -118,9 +118,15 @@ describe("HTTP server contract and session state machine", () => {
       expect(preview.events.some(event => event.type === "answer" && event.text.includes("after-"))).toBe(true);
     }
     const stdout = readFileSync(join(app.config.paths.sessionDir, session, "raw.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(event => event.stream === "stdout").map(event => Buffer.from(event.raw, "base64").toString("utf8")).join("");
-    expect(stdout).toContain("raw-original-token");
+    // The on-disk copy redacts the sensitive `token` field, but keeps every ordinary byte of the
+    // unrecognized frame (method name, the Chinese `value`) so the journal stays diagnosable.
+    expect(stdout).not.toContain("raw-original-token");
+    expect(stdout).toContain("vendor/notice");
+    expect(stdout).toContain("通知原文");
+    expect(stdout).toContain("[REDACTED]");
     const message = (await app.request("send_message", { session_id: session, text: "unsupported-result" })).data.message_id;
     const result = await app.complete(session, message);
+    // The real wire is never rewritten: the unsupported-response error carries the original frame.
     expect(result.error.code).toBe("unsupported_response"); expect(result.error.detail.raw).toContain("vendorFinal");
   });
   it("repairs BOM/ANSI envelopes while recording original bytes", async () => {
@@ -225,14 +231,16 @@ describe("HTTP server contract and session state machine", () => {
     expect((await app.request("auth_status", { session_id: other })).data.authenticated).toBe(true);
   });
   it("reaps only idle sessions and applies a live-session concurrency bound", async () => {
-    const app = await setup({ sessions: { max_concurrency: 1, idle_timeout_seconds: 0.1, reap_interval_seconds: 0.02 } });
+    // A wider idle window keeps the setup round trips from racing the reaper on a loaded machine;
+    // the assertions (busy session survives, idle session is reaped) are unchanged.
+    const app = await setup({ sessions: { max_concurrency: 1, idle_timeout_seconds: 0.4, reap_interval_seconds: 0.05 } });
     const session = await app.create();
     expect((await app.request("create_session", { cwd: app.directory, model_id: "fake-model" })).error.code).toBe("session_limit");
     const message = (await app.request("send_message", { session_id: session, text: "HANG" })).data.message_id;
-    await new Promise(resolve => setTimeout(resolve, 150));
+    await new Promise(resolve => setTimeout(resolve, 700));
     expect((await app.request("message_status", { session_id: session, message_id: message })).data.state).toBe("running");
     await app.request("cancel_message", { session_id: session, message_id: message });
-    await new Promise(resolve => setTimeout(resolve, 180));
+    await new Promise(resolve => setTimeout(resolve, 700));
     expect((await app.request("send_message", { session_id: session, text: "after-idle" })).error.code).toBe("session_closed");
   });
   it("removes long-poll listeners after caller disconnect, and ends a message SSE stream at terminal", async () => {

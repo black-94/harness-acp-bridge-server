@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { Redactor } from "./redact.js";
 
 export const RAW_FILE = "raw.jsonl";
 export const SESSION_FILE = "session.json";
@@ -26,8 +27,8 @@ export function writeAtomicFileSync(path: string, text: string): void {
     if (existsSync(temporary)) unlinkSync(temporary);
   }
 }
-export function writeJsonAtomicSync(path: string, value: unknown): void {
-  writeAtomicFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
+export function writeJsonAtomicSync(path: string, value: unknown, redactor?: Redactor): void {
+  writeAtomicFileSync(path, `${JSON.stringify(redactor ? redactor.value(value) : value, null, 2)}\n`);
 }
 export function readJsonFileSafe(path: string): Record<string, unknown> | null {
   try {
@@ -55,7 +56,7 @@ export class SessionStore extends EventEmitter {
   readonly rawPath: string;
   private seq = 0;
   messageId: string | null = null;
-  constructor(root: string, readonly sessionId: string) {
+  constructor(root: string, readonly sessionId: string, readonly redactor: Redactor = new Redactor()) {
     super();
     this.directory = sessionDirectory(root, sessionId);
     mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -74,13 +75,15 @@ export class SessionStore extends EventEmitter {
     return record;
   }
   wire(stream: "stdin" | "stdout" | "stderr", raw: Buffer, fragment = false): RawEvent {
-    return this.append({ type: "transport", stream, encoding: "base64", raw: raw.toString("base64"), fragment });
+    // The on-disk copy is redacted; the original bytes are delivered/written unchanged elsewhere.
+    const safe = this.redactor.bytes(raw);
+    return this.append({ type: "transport", stream, encoding: "base64", raw: safe.toString("base64"), fragment });
   }
-  event(event: string, data?: unknown): RawEvent { return this.append({ type: "lifecycle", event, data }); }
-  session(value: unknown): void { writeJsonAtomicSync(join(this.directory, SESSION_FILE), value); }
-  queue(value: unknown): void { writeJsonAtomicSync(join(this.directory, QUEUE_FILE), value); }
+  event(event: string, data?: unknown): RawEvent { return this.append({ type: "lifecycle", event, data: this.redactor.value(data) }); }
+  session(value: unknown): void { writeJsonAtomicSync(join(this.directory, SESSION_FILE), this.redactor.value(value)); }
+  queue(value: unknown): void { writeJsonAtomicSync(join(this.directory, QUEUE_FILE), this.redactor.value(value)); }
   result(id: string, value: unknown): void {
     if (!isValidSessionId(id)) throw new Error("invalid message_id");
-    writeJsonAtomicSync(join(this.directory, RESULTS_DIR, `${id}.json`), value);
+    writeJsonAtomicSync(join(this.directory, RESULTS_DIR, `${id}.json`), this.redactor.value(value));
   }
 }

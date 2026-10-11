@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import { BridgeError } from "../errors.js";
 import { SessionStore } from "../persistence.js";
+import { type StreamRedactor } from "../redact.js";
 import { SUPERVISOR_SPEC_ENV, type SupervisorSpec } from "../runtime.js";
 
 export class StdioTransport extends EventEmitter {
@@ -14,8 +15,16 @@ export class StdioTransport extends EventEmitter {
   private closePromise: Promise<void> | null = null;
   private exited: Promise<void> = Promise.resolve();
   private gone = false;
+  private stdoutClosed = false;
   private stderrPartial = Buffer.alloc(0);
-  constructor(readonly store: SessionStore, readonly maxLineBytes: number) { super(); }
+  /** Bounded redactors so a secret split across stderr chunks / oversized fragments never lands. */
+  private readonly stderrRedactor: StreamRedactor;
+  private readonly fragmentRedactor: StreamRedactor;
+  constructor(readonly store: SessionStore, readonly maxLineBytes: number) {
+    super();
+    this.stderrRedactor = store.redactor.stream("utf8");
+    this.fragmentRedactor = store.redactor.stream("latin1");
+  }
   start(spec: SupervisorSpec): void {
     if (this.child) throw new BridgeError("already_started", "transport already started");
     const child = spawn(process.execPath, [fileURLToPath(new URL("../supervisor.js", import.meta.url))], {
@@ -28,6 +37,12 @@ export class StdioTransport extends EventEmitter {
     child.stdout.on("data", (chunk: Buffer) => {
       try { this.receive(chunk); } catch (error) { this.emit("fault", new BridgeError("storage_error", String(error))); }
     });
+    // The ACP read channel ending is a transport fault, not necessarily a process exit: a
+    // supervisor can stay alive (or a remote/pipe channel can break) after the harness closes
+    // stdout. Converge the session; `gone` stays false so `close()` still terminates whatever
+    // survives. The flag keeps the paired 'end'/'close' events from double-emitting.
+    child.stdout.on("end", () => this.onStdoutClosed());
+    child.stdout.on("close", () => this.onStdoutClosed());
     child.stderr.on("data", (chunk: Buffer) => {
       try { this.receiveStderr(chunk); } catch (error) { this.emit("fault", new BridgeError("storage_error", String(error))); }
     });
@@ -36,12 +51,40 @@ export class StdioTransport extends EventEmitter {
       this.gone = true;
       try {
         if (this.size && !this.overflow) this.deliver();
-        if (this.stderrPartial.length) this.store.wire("stderr", this.stderrPartial);
+        this.flushStreams();
         this.store.event("transport_exited", { code, signal });
       } catch (error) { this.emit("fault", new BridgeError("storage_error", String(error))); }
       this.emit("exit", { code, signal });
     });
   }
+  /** Emit any bytes held back by the bounded redactors (EOF). */
+  private flushStreams(): void {
+    if (this.stderrPartial.length) { const tail = this.stderrPartial; this.stderrPartial = Buffer.alloc(0); this.emitStderr(this.stderrRedactor.push(tail)); }
+    this.emitStderr(this.stderrRedactor.flush());
+    this.emitFragment(this.fragmentRedactor.flush());
+  }
+  /**
+   * The stdout (ACP read) channel ended while this transport was still active.
+   *
+   * A final complete frame that was written **without a trailing newline** only becomes
+   * deliverable at EOF (a normal exit delivers it from the `close` handler). Deliver it here,
+   * in this same synchronous call, *before* emitting the fault: the resolved prompt response
+   * settles in the first microtask, ahead of the fault's deferred `close()`/`finishClose`, so a
+   * prompt whose final response arrived can still finish `completed` instead of being failed by
+   * the channel close. The transport is not `gone`, so a later `close()` still reaps a lingering
+   * child. The flag keeps the paired 'end'/'close' events from double-emitting.
+   */
+  private onStdoutClosed(): void {
+    if (this.stdoutClosed) return;
+    this.stdoutClosed = true;
+    try {
+      if (this.size && !this.overflow) this.deliver();
+      this.flushStreams();
+    } catch (error) { this.emit("fault", new BridgeError("storage_error", String(error))); }
+    this.emit("fault", new BridgeError("transport_closed", "harness stdout closed (ACP channel ended)"));
+  }
+  private emitStderr(buffer: Buffer): void { if (buffer.length) this.store.wire("stderr", buffer); }
+  private emitFragment(buffer: Buffer): void { if (buffer.length) this.store.wire("stdout", buffer, true); }
   private receiveStderr(chunk: Buffer): void {
     const bytes = Buffer.concat([this.stderrPartial, chunk]);
     let start = bytes.length - 1;
@@ -52,7 +95,7 @@ export class StdioTransport extends EventEmitter {
       const width = lead >= 0xf0 && lead <= 0xf4 ? 4 : lead >= 0xe0 && lead <= 0xef ? 3 : lead >= 0xc2 && lead <= 0xdf ? 2 : 1;
       if (start + width > bytes.length) end = start;
     }
-    if (end) this.store.wire("stderr", bytes.subarray(0, end));
+    if (end) this.emitStderr(this.stderrRedactor.push(bytes.subarray(0, end)));
     this.stderrPartial = Buffer.from(bytes.subarray(end));
   }
   receive(chunk: Buffer): void {
@@ -61,17 +104,17 @@ export class StdioTransport extends EventEmitter {
       const newline = chunk.indexOf(10, offset);
       const end = newline < 0 ? chunk.length : newline + 1;
       const piece = chunk.subarray(offset, end);
-      if (this.overflow) this.store.wire("stdout", piece, true);
+      if (this.overflow) this.emitFragment(this.fragmentRedactor.push(piece));
       else if (this.size + piece.length - (newline < 0 ? 0 : 1) > this.maxLineBytes) {
-        for (const part of this.parts) this.store.wire("stdout", part, true);
-        this.store.wire("stdout", piece, true);
+        for (const part of this.parts) this.emitFragment(this.fragmentRedactor.push(part));
+        this.emitFragment(this.fragmentRedactor.push(piece));
         this.parts = []; this.size = 0; this.overflow = true;
         this.emit("fault", new BridgeError("line_too_large", `ACP line exceeds ${this.maxLineBytes} bytes`));
       } else {
         this.parts.push(piece); this.size += piece.length;
         if (newline >= 0) this.deliver();
       }
-      if (newline >= 0 && this.overflow) this.overflow = false;
+      if (newline >= 0 && this.overflow) { this.overflow = false; this.emitFragment(this.fragmentRedactor.flush()); }
       offset = end;
     }
   }

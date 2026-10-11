@@ -24,7 +24,7 @@
  * `--emit-garbage` writes a non-JSON line at startup, before the ACP handshake.
  */
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import process from "node:process";
 
 const FLAGS = new Set(process.argv.slice(2));
@@ -64,6 +64,11 @@ let pendingInfo = null;
 let pendingElicitation = null;
 let authenticated = !AUTH_REQUIRED;
 let optionsHang = FLAGS.has("--options-hang");
+/**
+ * When set, record every received prompt text verbatim. This is the harness's own proof that the
+ * bridge delivered the ORIGINAL credential bytes on the wire (before any on-disk redaction).
+ */
+const PROMPT_FILE = process.env.FAKE_HARNESS_PROMPT_FILE;
 
 const AVAILABLE_MODELS = [
   { modelId: "fake-model", name: "Fake Model" },
@@ -89,6 +94,42 @@ function finishPrompt(promptId, stopReason) {
 
 function startPrompt(id, text) {
   pendingPrompt = { id, text, done: false, timer: null };
+  if (PROMPT_FILE) appendFileSync(PROMPT_FILE, `${text}\n`);
+  // Close the ACP read channel but keep the process alive: the bridge must converge on stdout
+  // EOF rather than waiting for a process exit. (Must run before any stdout write.)
+  if (text.includes("CLOSE_STDOUT")) {
+    setInterval(() => {}, 1000);
+    process.stdout.end();
+    return;
+  }
+  // Final prompt response written WITHOUT a trailing newline, then the channel closes while the
+  // process stays alive: only the daemon's EOF delivery can parse it.
+  if (text.includes("FINAL_NO_NEWLINE")) {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } }));
+    setInterval(() => {}, 1000);
+    process.stdout.end();
+    return;
+  }
+  // A truncated JSON tail at EOF: the malformed-final-frame contract must fail the message.
+  if (text.includes("PARTIAL_JSON")) {
+    process.stdout.write(`{"jsonrpc":"2.0","id":${id},"result":{"stopReason"`);
+    setInterval(() => {}, 1000);
+    process.stdout.end();
+    return;
+  }
+  // Usage/idle heartbeats with no model progress, then a real answer chunk and completion.
+  if (text.includes("USAGE_THEN_TEXT")) {
+    let beats = 0;
+    const timer = setInterval(() => {
+      update({ sessionUpdate: "usage_update", used: 1, size: 100 });
+      if (++beats >= 6) { clearInterval(timer); chunk(" real-progress"); finishPrompt(id, "end_turn"); }
+    }, 50);
+    timer.unref?.();
+    return;
+  }
+  if (text.includes("FORCE_EXIT")) process.exit(3);
+  // Never emit anything and never finish: a running message with zero observed progress.
+  if (text.includes("SILENT_HANG")) return;
   if (text.includes("arm-options-hang")) optionsHang = true;
   const echo = `echo:${text}`;
   const middle = Math.ceil(echo.length / 2);
@@ -116,6 +157,37 @@ function startPrompt(id, text) {
   }
   if (text.includes("unsupported-result")) {
     send({ jsonrpc: "2.0", id, result: { vendorFinal: true } }); return;
+  }
+  // A structure carrying every sensitive-field shape (string/number/null/object/array), plus
+  // non-sensitive neighbours that must survive (public_key, max_tokens, token_count, ids) and an
+  // embedded PEM, an escaped-JSON body credential, and a plain UTF-8/emoji/BOM field.
+  //
+  // The opaque children (`label`, `other`, `cookie` items) are deliberately NOT sensitive-named:
+  // masking must follow the sensitive PARENT key and replace the whole subtree, not just children
+  // whose own names happen to look sensitive.
+  if (text.includes("privacy-fields")) {
+    send({ jsonrpc: "2.0", method: "vendor/privacy", params: {
+      password: "pw-sentinel-aaa",
+      token: 424242,
+      secret: null,
+      credentials: { label: "api-sentinel-ddd", nested: { other: "rt-sentinel-bbb" } },
+      cookie: ["at-sentinel-ccc"],
+      list: [{ note: "ordinary text" }],
+      public_key: "public-key-value-kept",
+      max_tokens: 100,
+      token_count: 5,
+      session_id: "sess-keep-1",
+      body: "prefix {\"token\":\"escaped-body-token-987654\"} suffix 😀",
+      pem: "-----BEGIN RSA PRIVATE KEY-----\nMIIEpem-body-SENTINEL-eee\n-----END RSA PRIVATE KEY-----",
+      value: "普通正文😀 \ufeff"
+    } });
+    chunk(" done-privacy");
+    finishPrompt(id, "end_turn"); return;
+  }
+  // An unsupported response whose credential lives in a sensitive field: the persisted error
+  // detail must be redacted while the non-sensitive marker survives.
+  if (text.includes("privacy-error")) {
+    send({ jsonrpc: "2.0", id, result: { vendorFinal: true, token: "err-sentinel-fff" } }); return;
   }
   if (text.includes("HOLD")) {
     pendingPrompt.timer = setTimeout(() => {

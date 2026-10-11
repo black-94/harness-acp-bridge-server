@@ -8,6 +8,7 @@ import { assertAllowedKeys, normalizeCreateParams } from "../create-params.js";
 import { BridgeError, isRecord } from "../errors.js";
 import { isValidSessionId, newSessionId, QUEUE_FILE, RAW_FILE, readJsonFileSafe, RESULTS_DIR, SESSION_FILE, sessionDirectory, writeJsonAtomicSync } from "../persistence.js";
 import { readPreview } from "../preview/reader.js";
+import { Redactor, collectSecrets } from "../redact.js";
 import { HarnessSession } from "./session.js";
 
 export const METHODS = ["ping", "search_harness", "create_session", "close_session", "authenticate", "auth_status", "set_session_options", "send_message", "cancel_message", "message_status", "live_output", "answer_question"] as const;
@@ -26,11 +27,13 @@ function integer(value: unknown, fallback: number, min: number, max: number, nam
 export class HarnessService {
   readonly sessions = new Map<string, HarnessSession>();
   private readonly auth: AuthCoordinator;
+  private readonly redactor: Redactor;
   private reaper: ReturnType<typeof setInterval> | null = null;
   private stopping = false;
   private readonly startedAt = Date.now();
   private lockToken: string | null = null;
   constructor(readonly config: BridgeConfig) {
+    this.redactor = new Redactor(collectSecrets(process.env, config.harnesses));
     this.auth = new AuthCoordinator({ ledger: new AuthLedger({ path: config.authentication.ledgerPath, rateLimit: config.authentication.rateLimit }),
       maxConcurrentTargets: config.authentication.maxConcurrentTargets, timeoutSeconds: config.timeouts.authenticationTimeoutSeconds,
       closeSession: async id => { await this.sessions.get(id)?.close(); } });
@@ -118,7 +121,7 @@ export class HarnessService {
         const id = options.sessionId ?? newSessionId();
         if (!isValidSessionId(id)) throw new BridgeError("invalid_param", "invalid session_id");
         if (this.sessions.has(id) || existsSync(sessionDirectory(this.config.paths.sessionDir, id))) throw new BridgeError("session_exists", "session_id already exists");
-        const session = new HarnessSession(this.config, options, id);
+        const session = new HarnessSession(this.config, options, id, this.redactor);
         this.sessions.set(id, session);
         await session.initialize();
         if (options.authenticate && !session.isAuthenticated()) await this.auth.authenticate(session, options.authenticate);
@@ -238,12 +241,12 @@ export class HarnessService {
           const { result, ...status } = previous; Object.assign(message, status);
         } else {
           Object.assign(message, { state: "failed", terminal: true, questions: [], finished_at: new Date().toISOString(), error: { code: "session_interrupted", message: "server restarted during message processing" }, result: null });
-          writeJsonAtomicSync(resultPath, message);
+          writeJsonAtomicSync(resultPath, message, this.redactor);
         }
       }
       if (!wasLive && !changed) continue;
-      writeJsonAtomicSync(join(directory, QUEUE_FILE), { ...queue, active_message_id: null, messages });
-      writeJsonAtomicSync(join(directory, SESSION_FILE), { ...snapshot, state: wasLive ? "interrupted" : snapshot.state, operation: "closed", updated_at: new Date().toISOString() });
+      writeJsonAtomicSync(join(directory, QUEUE_FILE), { ...queue, active_message_id: null, messages }, this.redactor);
+      writeJsonAtomicSync(join(directory, SESSION_FILE), { ...snapshot, state: wasLive ? "interrupted" : snapshot.state, operation: "closed", updated_at: new Date().toISOString() }, this.redactor);
       const rawPath = join(directory, RAW_FILE);
       if (!existsSync(rawPath) || lstatSync(rawPath).isSymbolicLink()) continue;
       // Recover the sequence using only the tail. Trim a crash's incomplete final append.

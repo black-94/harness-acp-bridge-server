@@ -133,6 +133,43 @@ A request timeout closes the session to prevent a late reply from silently chang
 session. All deadlines are under `timeouts`; successful file writes allow forwarding without
 per-event `fsync`.
 
+## Waiting, activity, and channel EOF
+
+A `running` state means the bridge is still waiting for the ACP `session/prompt` result; it does
+**not** guarantee the model is still making progress. An idle-but-alive harness (CPU 0, no new
+frames) and a stalled one are indistinguishable from state alone, so the server never fabricates a
+terminal state for silence.
+
+Each `message_status` (and the session snapshot) reports an `activity` object:
+
+| Field | Meaning |
+|---|---|
+| `last_transport_event_at` | When the last complete stdout frame arrived (any frame, including RPC responses). `null` before any. |
+| `last_progress_at` | When the harness last produced real output (answer/reasoning/tool frames) or asked a question. `null` if it never has. |
+| `observed_phase` | Last observed phase: `thinking`, `responding`, `tool_use`, `usage`, `session_update`, or `waiting_input`. An observed `usage`/idle update is never treated as the prompt's final result. |
+| `seconds_since_progress` | Seconds since `last_progress_at`, or since submission when the harness has produced nothing yet. |
+| `seconds_since_transport_event` | Seconds since `last_transport_event_at`. |
+| `stall_hint_seconds` | Configured `sessions.stall_hint_seconds` (default 120; `0` disables). |
+| `stalled` | `true` when `running`, `stall_hint_seconds > 0`, and `seconds_since_progress` has reached it. Always `false` for a terminal message or while `waiting_input`. Advisory only. |
+
+Only real model output — `reasoning`, `answer`, and `tool_call`/`tool_output` frames, plus an actual
+reverse question — advances `last_progress_at`. Metadata frames (`usage_update`, config/session-info
+updates, `checkpoint`/`command`) may update `observed_phase` and `last_transport_event_at` as
+evidence, but a periodic usage/idle heartbeat **never** counts as progress and can never clear a
+stall. Values are per message: a new message resets `last_progress_at`/`observed_phase` rather than
+inheriting the previous message's. Polling `message_status`, `ping`, or `live_output`, and
+lifecycle/persistence work, **never** refresh these. A hint is only a hint: the server does not
+auto-cancel a silent message, and the absolute `timeouts.turn_timeout_seconds` still governs the
+hard deadline.
+
+Channel EOF is terminal: if the ACP stdout channel closes — including a harness or supervisor that
+closes stdout while its process stays alive — the running message converges to `failed` with
+`transport_closed` and a `finished_at`; on-disk `queue.json`/`results/`/`session.json` agree with
+`message_status`, and the busy slot is released (the session then rejects further sends as
+`session_closed`). A message that already reached a terminal result is never overwritten by a later
+EOF. `close_session`, `session_shutdown`, a supervisor/harness exit, and a server restart converge
+the same way (`session_interrupted` across a restart).
+
 ## Live output, cursors, and SSE
 
 ```json

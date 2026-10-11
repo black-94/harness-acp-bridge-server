@@ -280,6 +280,11 @@ function wireProxy(child: ChildProcess, context: SupervisorContext): void {
       process.stdout.once("drain", () => source.resume());
     }
   });
+  // The harness closed its stdout: the ACP channel is gone even if the process lingers. Clean up
+  // and exit so the daemon's read channel reaches EOF/close and the session converges instead of
+  // hanging until the turn timeout.
+  source?.on("end", () => void shutdown(context));
+  source?.on("close", () => void shutdown(context));
   child.stderr?.on("data", (chunk: Buffer) => {
     process.stderr.write(chunk);
   });

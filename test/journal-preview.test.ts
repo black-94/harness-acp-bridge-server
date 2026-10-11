@@ -13,12 +13,15 @@ function store() { const root = mkdtempSync(join(tmpdir(), "hab-journal-")); dir
 function rawEvents(journal: SessionStore): any[] { return readFileSync(journal.rawPath, "utf8").trim().split("\n").map(line => JSON.parse(line)); }
 const frame = (text: string): Buffer => Buffer.from(`${JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } })}\n`);
 describe("lossless journal and stateless previews", () => {
-  it("journals original bytes before delivering fragmented UTF-8 lines", () => {
+  it("journals a redacted copy with every non-sensitive UTF-8/BOM byte intact, then delivers the original fragmented line", () => {
     const journal = store(); const transport = new StdioTransport(journal, 4096);
     const payload = Buffer.from(' \ufeff{"custom":"字😀","token":"original"}\r\n');
+    // Only the sensitive `token` value changes on disk; the BOM, the multibyte text, the ordinary
+    // field, and the CRLF must survive byte-for-byte.
+    const redacted = Buffer.from(' \ufeff{"custom":"字😀","token":"[REDACTED]"}\r\n');
     let delivered = 0;
     transport.on("line", (line: Buffer) => {
-      expect(Buffer.from(rawEvents(journal)[0].raw, "base64")).toEqual(payload);
+      expect(Buffer.from(rawEvents(journal)[0].raw, "base64")).toEqual(redacted);
       expect(line).toEqual(payload); delivered++;
     });
     for (let index = 0; index < payload.length; index++) transport.receive(payload.subarray(index, index + 1));

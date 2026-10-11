@@ -10,6 +10,7 @@ import { declaredThinkingLevels, resolveHarness, type BridgeConfig } from "../co
 import { type CreateSessionParams } from "../create-params.js";
 import { BridgeError, deadline, errorInfo, isRecord } from "../errors.js";
 import { readJsonFileSafe, SessionStore } from "../persistence.js";
+import { Redactor, collectSecrets } from "../redact.js";
 import { StdioTransport } from "../transport/stdio.js";
 import { inspectContainer, newRemotePidFile, type LaunchSpec } from "../runtime.js";
 
@@ -62,7 +63,16 @@ export class HarnessSession {
   private unsupported: unknown[] = [];
   private closePromise: Promise<void> | null = null;
   lastActivity = Date.now();
-  constructor(readonly config: BridgeConfig, readonly params: CreateSessionParams, sessionId: string) {
+  /**
+   * Real harness progress, moved only by ACP output and reverse questions — never by polling
+   * (`message_status`/`ping`/`live_output`), lifecycle journaling, persistence, or the idle
+   * reaper. `lastTransportEventAt` tracks any complete stdout frame (including RPC responses);
+   * `lastProgressAt` tracks only frames that carry model output or ask for input.
+   */
+  private lastTransportEventAt: number | null = null;
+  private lastProgressAt: number | null = null;
+  private observedPhase: string | null = null;
+  constructor(readonly config: BridgeConfig, readonly params: CreateSessionParams, sessionId: string, redactor?: Redactor) {
     const harness = resolveHarness(config, params.harness);
     this.sessionId = sessionId;
     this.adapter = getAdapter(harness.name);
@@ -88,12 +98,14 @@ export class HarnessSession {
       terminateGraceSeconds: config.timeouts.terminateGraceSeconds,
       remoteCleanupTimeoutSeconds: config.timeouts.remoteCleanupTimeoutSeconds,
     };
-    this.store = new SessionStore(config.paths.sessionDir, sessionId);
+    this.store = new SessionStore(config.paths.sessionDir, sessionId, redactor ?? new Redactor(collectSecrets(process.env, config.harnesses)));
     this.metadataPath = join(tmpdir(), `harness-acp-${randomUUID()}.json`);
     this.transport = new StdioTransport(this.store, config.buffers.maxReadBytes);
     this.protocol = new ProtocolAdapter(this.transport, this.adapter);
     this.transport.on("fault", error => this.onFault(error));
     this.protocol.on("fault", error => this.onFault(error));
+    // Any complete frame from the harness is transport activity; this never edits message state.
+    this.transport.on("line", () => { this.lastTransportEventAt = Date.now(); });
     this.transport.on("exit", () => {
       if (!this.closePromise) void this.close(new BridgeError("transport_closed", "harness exited unexpectedly")).catch(() => undefined);
     });
@@ -163,6 +175,7 @@ export class HarnessSession {
     this.launchInfo = readJsonFileSafe(this.metadataPath) ?? this.launchInfo;
     return { version: 2, session_id: this.sessionId, harness: this.adapter.name, state: this.state,
       operation: this.operation, created_at: this.createdAt, updated_at: iso(), last_activity_at: new Date(this.lastActivity).toISOString(),
+      activity: this.activity(),
       cwd: this.params.cwd, target: this.params.target, runtime: this.params.runtime,
       remote_host: this.params.remoteHost, container_policy: this.params.containerPolicy,
       harness_session_id: this.protocol.sessionId, options: this.options(), auth: this.authInfo(),
@@ -188,6 +201,40 @@ export class HarnessSession {
   private assertOpen(): void { if (this.isClosed || this.closePromise) throw new BridgeError("session_closed", "session is closed"); }
   private assertIdle(): void { this.assertOpen(); if (this.operation !== "idle") throw new BridgeError("busy", `session is ${this.operation}`); }
   private touch(): void { this.lastActivity = Date.now(); }
+  /**
+   * Observed harness activity for a UI hint. Read-only: computing it never advances a timestamp,
+   * so repeated `message_status`/`ping`/`live_output` polls cannot fabricate progress.
+   *
+   * A running state means "the bridge is still waiting for the ACP prompt result", not "the model
+   * is still making progress". `baseline` (a message's submission time) is used only when the
+   * harness has produced no progress yet, so a message that never emitted anything is still
+   * measurable; `last_progress_at` stays null to show it has never reported progress.
+   */
+  private activity(baseline?: number | null): Record<string, unknown> {
+    const now = Date.now();
+    const secondsSince = (at: number | null): number | null => (at === null ? null : Math.max(0, (now - at) / 1000));
+    const secondsSinceProgress = secondsSince(this.lastProgressAt ?? baseline ?? null);
+    const stallHint = this.config.sessions.stallHintSeconds;
+    return {
+      last_transport_event_at: this.lastTransportEventAt === null ? null : new Date(this.lastTransportEventAt).toISOString(),
+      last_progress_at: this.lastProgressAt === null ? null : new Date(this.lastProgressAt).toISOString(),
+      observed_phase: this.observedPhase,
+      seconds_since_progress: secondsSinceProgress,
+      seconds_since_transport_event: secondsSince(this.lastTransportEventAt),
+      stall_hint_seconds: stallHint,
+      stalled: stallHint > 0 && secondsSinceProgress !== null && secondsSinceProgress >= stallHint,
+    };
+  }
+  private static phaseOf(event: OutputEvent): string | null {
+    if (event.type === "reasoning") return "thinking";
+    if (event.type === "answer") return "responding";
+    if (event.type === "tool_call" || event.type === "tool_output") return "tool_use";
+    if (event.type === "session_options") {
+      const kind = isRecord(event.data) ? event.data.sessionUpdate : undefined;
+      return kind === "usage_update" ? "usage" : "session_update";
+    }
+    return null;
+  }
   private assertThinkingLevel(model: string, level: string | null): void {
     const levels = declaredThinkingLevels(this.config, resolveHarness(this.config, this.params.harness).name, model);
     if (level && levels !== null && !levels.includes(level)) throw new BridgeError("unsupported_request", `thinking_level ${level} is not configured for model ${model}`);
@@ -272,6 +319,10 @@ export class HarnessSession {
     const message: Message = { id, state: "running", text: "", reasoning: "", tools: new Map(), submittedAt: iso(), finishedAt: null,
       questions: new Map(), ticket: null, done: Promise.resolve(), cancelRequested: false, unsupported: [] };
     this.active = message; this.messages.set(id, message);
+    // Progress is per message: a fresh message must not inherit the previous message's
+    // last_progress_at/observed_phase (which would immediately look stalled or show a stale phase).
+    this.lastProgressAt = null;
+    this.observedPhase = null;
     if (keyHash) this.idempotency[keyHash] = { hash, message_id: id };
     try { this.persist(); }
     catch (error) {
@@ -316,14 +367,27 @@ export class HarnessSession {
       return result;
     }
     const done = terminal(message.state);
+    const activity = this.activity(Date.parse(message.submittedAt));
+    // A finished message is not "stalled", and a message waiting on the user is waiting on input,
+    // not on the model: neither should report a stall hint.
+    if (done || message.state === "waiting_input") activity.stalled = false;
     return { session_id: this.sessionId, message_id: id, state: message.state, terminal: done,
       submitted_at: message.submittedAt, finished_at: message.finishedAt,
+      activity,
       unsupported: message.unsupported,
       questions: [...message.questions.values()].map(({ rpc_id, ...question }) => question),
       ...(message.failure ? { error: message.failure } : {}),
       ...(done ? { result: { text: message.text, reasoning: message.reasoning, tool_calls: [...message.tools.values()], stop_reason: message.stopReason ?? null, raw_result: message.response ?? null } } : {}) };
   }
   private onOutput(event: OutputEvent): void {
+    // Only real model output advances the business progress clock. Metadata frames
+    // (usage_update/config/session_info/plan, `_codebuddy.ai/*`) may update the observed phase as
+    // evidence, but a periodic usage/idle heartbeat must never clear a stall.
+    if (event.type === "reasoning" || event.type === "answer" || event.type === "tool_call" || event.type === "tool_output") {
+      this.lastProgressAt = Date.now();
+    }
+    const phase = HarnessSession.phaseOf(event);
+    if (phase !== null) this.observedPhase = phase;
     const message = this.active;
     if (!message || terminal(message.state)) return;
     if (event.type === "answer") message.text += event.text;
@@ -334,6 +398,8 @@ export class HarnessSession {
     }
   }
   private onQuestion(question: Question): void {
+    this.lastProgressAt = Date.now();
+    this.observedPhase = "waiting_input";
     const message = this.active;
     if (!message || message.cancelRequested) {
       void this.protocol.send({ jsonrpc: "2.0", id: question.rpc_id, error: { code: -32601, message: "no message awaiting input" } }).catch(error => this.onFault(error)); return;

@@ -104,6 +104,13 @@ export interface BridgeConfig {
     maxConcurrency: number;
     idleTimeoutSeconds: number;
     reapIntervalSeconds: number;
+    /**
+     * Threshold (seconds) after which a still-running message with no observed harness
+     * progress is flagged as `stalled` for a UI hint. Advisory only: it never changes the
+     * absolute `turnTimeoutSeconds` semantics and never fabricates a terminal state.
+     * `0` disables the hint.
+     */
+    stallHintSeconds: number;
   };
   timeouts: {
     startupTimeoutSeconds: number;
@@ -201,6 +208,7 @@ const fileSchema = z
         max_concurrency: z.number().int().positive().default(2),
         idle_timeout_seconds: z.number().nonnegative().default(3600),
         reap_interval_seconds: z.number().positive().default(30),
+        stall_hint_seconds: z.number().nonnegative().default(120),
       })
       .strict()
       .default({}),
@@ -382,6 +390,7 @@ function resolveConfig(file: FileConfig, configPath: string | null): BridgeConfi
       maxConcurrency: file.sessions.max_concurrency,
       idleTimeoutSeconds: file.sessions.idle_timeout_seconds,
       reapIntervalSeconds: file.sessions.reap_interval_seconds,
+      stallHintSeconds: file.sessions.stall_hint_seconds,
     },
     timeouts: {
       startupTimeoutSeconds: file.timeouts.startup_timeout_seconds,
