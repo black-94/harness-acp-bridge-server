@@ -33,7 +33,37 @@ replacement message. A cancellation timeout closes the session instead of allowi
 `message_status` always addresses a message ID. Pending questions include original request
 IDs and offered permission options; `answer_question` validates the pending question and
 routes the selected answer using the original RPC ID. Completed/failed/cancelled messages
-include a result. `live_output` derives preview pages from `raw.jsonl` throughout the lifecycle.
+include a result, and a running message also carries an optional bounded `progress`
+snapshot (`{text, reasoning, tool_calls}`).
+
+## Interactive authentication
+
+`authenticate` takes only `{session_id}` and returns a flow snapshot immediately; it never
+blocks and never accepts a caller-chosen method.
+
+```mermaid
+stateDiagram-v2
+    [*] --> waiting_input: authenticate
+    waiting_input --> authenticating: answer method_id (never auto-selected)
+    authenticating --> waiting_input: reverse question (URL / token / permission)
+    waiting_input --> authenticating: answer_question (no message_id)
+    authenticating --> ready: real authenticate + session open
+    authenticating --> failed: error / authentication timeout
+    waiting_input --> cancelled: reject / cancel / input timeout
+    authenticating --> cancelled: cancel (session is taken down)
+    ready --> [*]
+    failed --> [*]
+    cancelled --> [*]
+```
+
+A browser step (CodeBuddy auth URL, Agy stderr login URL, Codex device-code URL elicitation)
+is normalized to a question whose message carries the full usable URL and whose schema asks
+for `opened: true`; confirming only acknowledges and never flips the flow to `ready`. Method
+selection is an information question requiring `method_id`; unsupported candidate types are
+listed but never executed. `auth_status` returns the flow snapshot read-only while one exists,
+and otherwise probes the harness. Cancelling a started login abandons the in-flight request and
+closes the half-authenticated session (no `session/cancel` with a null id), so a late success
+cannot revive it.
 
 Unexpected or unsupported notifications are recorded without releasing or failing the message
 slot. Invalid JSONL and oversized lines request cancellation before session termination.

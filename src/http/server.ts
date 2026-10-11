@@ -1,4 +1,4 @@
-/** HTTP boundary: route/JSON validation, response envelopes, disconnects, and SSE framing. */
+/** HTTP boundary: route/JSON validation, response envelopes, and client disconnects. */
 import { createServer, type Server, type ServerResponse, type IncomingMessage } from "node:http";
 import { BridgeError, errorInfo, isRecord } from "../errors.js";
 import { METHODS, HarnessService } from "../logic/service.js";
@@ -77,32 +77,11 @@ export class HarnessHttpServer {
       if (!METHODS.includes(method as typeof METHODS[number])) { json(response, 404, { ok: false, error: { code: "unsupported_request", message: "unknown HTTP endpoint" } }); return; }
       if (request.method !== "POST") { response.setHeader("allow", "POST"); json(response, 405, { ok: false, error: { code: "method_not_allowed", message: "use POST" } }); return; }
       const params = await this.body(request);
-      if (method === "live_output" && request.headers.accept?.includes("text/event-stream")) await this.sse(response, params, controller.signal);
-      else {
-        const result = await this.service.dispatch(method, params, { signal: controller.signal });
-        json(response, 200, { ok: true, data: result });
-      }
+      const result = await this.service.dispatch(method, params, { signal: controller.signal });
+      json(response, 200, { ok: true, data: result });
     } catch (error) {
       const info = errorInfo(error);
-      if (response.headersSent) {
-        if (!response.destroyed) response.end(`event: error\ndata: ${JSON.stringify({ ok: false, error: info })}\n\n`);
-      } else json(response, statusOf(info.code), { ok: false, error: info });
+      json(response, statusOf(info.code), { ok: false, error: info });
     } finally { this.requests.delete(controller); response.off("close", disconnect); }
-  }
-  private async sse(response: ServerResponse, params: Record<string, unknown>, signal: AbortSignal): Promise<void> {
-    // Validate session/cursor before starting a stream so failures retain JSON responses.
-    let page = await this.service.dispatch("live_output", { ...params, wait_ms: params.wait_ms ?? 0 }, { signal });
-    response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", "x-accel-buffering": "no" });
-    response.flushHeaders();
-    while (!signal.aborted) {
-      const frame = `id: ${page.next_cursor}\nevent: output\ndata: ${JSON.stringify({ ok: true, data: page })}\n\n`;
-      if (!response.write(frame)) await new Promise<void>(resolve => {
-        const done = (): void => { response.off("drain", done); response.off("close", done); resolve(); };
-        response.once("drain", done); response.once("close", done);
-      });
-      if (page.terminal && !page.has_more) { response.end(); return; }
-      page = await this.service.dispatch("live_output", { ...params, cursor: page.next_cursor, wait_ms: page.has_more ? 0 : Math.max(1000, Number(params.wait_ms ?? 15000)) }, { signal });
-    }
-    response.end();
   }
 }

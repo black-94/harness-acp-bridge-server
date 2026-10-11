@@ -52,7 +52,6 @@ const ALLOWED_KEYS = [
   "thinking_level",
   "permission_mode",
   "resume_session_id",
-  "authenticate",
   "session_id",
   "target",
   "remote_host",
@@ -87,7 +86,6 @@ export interface CreateSessionParams {
   dockerHostNetwork: boolean;
   containerPolicy: ContainerPolicy;
   resumeSessionId: string | null;
-  authenticate: string | null;
   sessionId: string | null;
 }
 
@@ -384,7 +382,6 @@ export function normalizeCreateParams(params: Record<string, unknown>): CreateSe
     dockerHostNetwork,
     containerPolicy: containerPolicy ?? (dockerId ? "keep" : "remove"),
     resumeSessionId: optionalString(params, "resume_session_id"),
-    authenticate: optionalString(params, "authenticate"),
     sessionId: optionalString(params, "session_id"),
   };
 }

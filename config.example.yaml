@@ -33,7 +33,7 @@ buffers:
   # ACP stdout line bound. Overflow fails the message and first requests cancellation.
   # All oversized bytes received are still recorded as bounded wire fragments.
   max_read_bytes: 100MiB
-  # Maximum number of rendered events returned by one live_output page.
+  # Maximum number of rendered events returned by one internal preview page.
   preview_page_events: 200
   # Maximum UTF-8 text bytes per event/page fragment, at least 4.
   preview_text_bytes: 16KiB

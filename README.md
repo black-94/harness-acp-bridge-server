@@ -1,7 +1,7 @@
 # harness-acp-bridge-server
 
 A session-scoped HTTP server for ACP harnesses. It owns harness processes, serializes
-message execution, records original traffic, and renders human-readable live output.
+message execution, records original traffic, and drives interactive authentication.
 
 ## Run
 
@@ -34,9 +34,6 @@ Main agent --HTTP POST--> http/server.ts --> logic/service.ts + logic/session.ts
                                               |
                                               v
                                           raw.jsonl
-                                              |
-                                              v
-                                      preview/reader.ts --> live_output
 ```
 
 1. **Transport** manages byte streams, newline framing, and the supervisor. It writes
@@ -50,10 +47,10 @@ Main agent --HTTP POST--> http/server.ts --> logic/service.ts + logic/session.ts
 3. **Logic** owns session operation slots, results, authentication coordination, idle
    reaping, and handshake/request/message/cancel/authentication/input deadlines. It
    decides whether to cancel a message or terminate its harness after an error.
-4. **HTTP** validates JSON requests, routes the twelve operations, returns JSON
-   envelopes, and handles client disconnects and SSE framing.
-5. **Preview** reads `raw.jsonl` directly and renders actual harness reasoning, answers,
-   tool calls, tool outputs, questions, and lifecycle events. It has no preview file and
+4. **HTTP** validates JSON requests, routes the operations, and returns JSON envelopes,
+   including client disconnects. There is no SSE stream.
+5. **Preview** is an internal, cursorable reader over `raw.jsonl`; it is not exposed over
+   HTTP. Callers observe progress through `message_status`. It has no preview file and
    retains no rolling text window.
 
 The supervisor owns the local harness process group and SSH/Docker cleanup. Server
@@ -74,16 +71,15 @@ return 409; unsupported operations/responses return 501; deadlines return 504.
 | --- | --- |
 | `ping` | `{}`. Server liveness, protocol version, PID, live-session count, config fingerprint. |
 | `search_harness` | `harness?`. Lists configured harnesses, models, declared thinking levels, and permission modes. Starts no harness and performs no discovery probes. |
-| `create_session` | Required `cwd`, `model_id`; optional `harness`, `thinking_level`, `permission_mode`, and launch fields below. Returns the session snapshot, including `session_id`, state, effective options, and launch info. |
-| `close_session` | `session_id`. Stops the harness and closes the session; repeated close is safe. |
-| `authenticate` | `session_id`, `method_id`. Authenticates the child harness and opens its session. Credential writes on the same target are serialized and optionally rate limited. |
-| `auth_status` | `session_id`. Probes harness authentication. An unavailable probe returns an `unsupported_response` error with original response/details; unknown authentication is not guessed as logged out. |
+| `create_session` | Required `cwd`, `model_id`; optional `harness`, `thinking_level`, `permission_mode`, and launch fields below. On success returns the session snapshot, including `session_id`, state, effective options, and launch info. If the harness is not logged in, the session is created and kept alive but the call returns `authentication_required` (403) with `detail.next_action` (use that `session_id` with `authenticate`; do not re-create it). |
+| `close_session` | `session_id`. Stops the harness and closes the session; repeated close is safe. Allowed even for a session that never authenticated. |
+| `authenticate` | `session_id` only. Starts (or reuses, or, after a finished flow, restarts) an interactive login and returns the flow snapshot immediately. It never takes a `method_id`. |
+| `auth_status` | `session_id`. While a flow exists, returns that flow's read-only snapshot — including a terminal `cancelled`/`failed` one with `questions: []` (no re-probe, no blocking); once the session is gone it returns `session_closed`. With no flow, probes the harness; an unavailable probe returns `unsupported_response` with original response/details, and an unknown status is never guessed as logged out. |
 | `set_session_options` | `session_id` plus one or more of `model_id`, `thinking_level`, `permission_mode`. Applies only session settings, while idle. |
 | `send_message` | `session_id`, `text`, optional `idempotency_key`. Returns only `{ "message_id": "..." }` after durable acceptance; execution is asynchronous. |
 | `cancel_message` | `session_id`, `message_id`. Requests cancellation and waits for the original prompt to settle. An unconfirmed cancellation closes the session. |
-| `message_status` | `session_id`, `message_id`. Returns state, `terminal`, pending `questions`, unsupported events, and errors. Terminal messages additionally include `result`. Works after close/restart. |
-| `live_output` | `session_id`, optional `message_id`, `cursor`, `limit`, `wait_ms`. Returns paged journal-derived human-readable events; optionally SSE. |
-| `answer_question` | `session_id`, `message_id`, `request_id`, optional `answer` (`accept`, `reject`, `timeout`, `cancel`, default `accept`), `option_id`, `content`. Uses the child harness's original RPC ID. Permissions require an offered option; information/form answers require an object. |
+| `message_status` | `session_id`, `message_id`. Returns state, `terminal`, pending `questions`, unsupported events, errors, and — while the message runs — an optional bounded, sanitized `progress` snapshot (`{text, reasoning, tool_calls}`). Terminal messages additionally include `result`. Works after close/restart. |
+| `answer_question` | `session_id`, `request_id`, optional `answer` (`accept`, `reject`, `timeout`, `cancel`, default `accept`), `option_id`, `content`, and optional `message_id`. With a `message_id` the answer routes to that message's reverse question; without one it answers the session's authentication flow. Permissions require an offered option; information/form answers require an object validated against the question's schema. |
 
 Authentication here is the child harness's login, not HTTP client authentication.
 Commands, argv, environment, SSH/Docker programs, state paths, and buffer settings are
@@ -97,11 +93,61 @@ administrator-owned configuration, not request parameters.
   `container_policy` (`remove`/`keep`), `mounts`, `ports`, and `host_network`.
 - `resume_session_id`: ask the harness to load its own existing session history.
 - `session_id`: optionally choose a new bridge session ID; existing directories are never overwritten.
-- `authenticate`: optional method ID, routed through the same authentication coordinator.
 
 Permission modes are `read`, `edit`, `auto`, `yolo`. Adapters determine whether a particular
 harness supports changing a mode live. Declared `thinking_levels: []` means none;
 omission means unknown, checked against live ACP options when available.
+
+## Authentication flow
+
+`authenticate` takes only `{session_id}` and returns a flow snapshot immediately; it never
+blocks on the login and never accepts a caller-chosen method. The snapshot is:
+
+```json
+{ "session_id": "…", "state": "waiting_input", "terminal": false,
+  "questions": [ … ], "candidates": [ … ], "authenticated": true, "error": { … } }
+```
+
+- `state` is `waiting_input`, `authenticating`, `ready`, `failed`, or `cancelled`; a rate-limited
+  attempt is `authentication_rate_limited` with `terminal: true`. An already logged-in session
+  returns `ready` with `terminal: true`.
+- `candidates` lists **every** advertised method as `{id, name, description?, type, supported}`.
+  `type` defaults to `agent`; any other type is unsupported (its `description` carries exactly
+  `Not supported in harness_acp_bridge`) and is never executed.
+- The flow always begins with an **information** question whose schema requires
+  `method_id: string` (an enum of the supported IDs); the message lists the candidates. A method
+  is never auto-selected, not even with a single candidate.
+- Further `questions` are ordinary reverse questions (`kind` `information`/`permission`/
+  `elicitation`) with `{request_id, kind, title, message, options, schema, raw?}`. Answer them
+  with `answer_question` and **no** `message_id`.
+- A browser step (CodeBuddy's `_codebuddy.ai/authUrl`, an Agy stderr login URL, a Codex
+  device-code URL elicitation) is a question whose message carries the full usable URL (and any
+  machine code) and whose schema asks for `opened: true`. **Confirming is only an
+  acknowledgement**: the session is `ready` only after the real harness `authenticate` call and
+  the session open both succeed. Confirming and re-answering never revives a closed session.
+- A `token`/`secret` step is an ordinary required-`string` schema answered as normal, and
+  multi-round flows are supported.
+
+Cancelling a started login abandons the in-flight request and takes the half-authenticated
+session down (no `session/cancel` with a null id). Cancelling at method selection ends only the
+flow. Answers are validated against the question schema; unknown or stale `request_id`s are
+rejected, and a harness `elicitation/complete` withdraws any still-pending question.
+
+If a harness is already logged in (for example a login completed outside the bridge),
+`authenticate` does not re-prompt for a method or write credentials: it opens the existing
+initialized session and reports `ready` only once that session is actually open. A genuine
+auth-required during session setup keeps the initialized harness alive so `authenticate` can
+finish it; an unrecoverable handshake failure closes it.
+
+**Recovery after `create_session`.** An unauthenticated `create_session` returns
+`authentication_required` with `detail.next_action = {method: "authenticate", params: {session_id}}`.
+The session is already created and initialized: call `authenticate` with that `session_id` to
+finish the login. Do **not** call `create_session` again with the same id — that is a
+`session_exists` error, not the post-login step.
+
+**After a flow ends.** `auth_status` returns the flow's terminal snapshot (`cancelled`/`failed`,
+`questions: []`) while it is still available, or a clear `session_closed` once the session is
+gone; it never re-prompts stale choices or keeps an input loop alive.
 
 ## Message execution and errors
 
@@ -157,7 +203,7 @@ reverse question — advances `last_progress_at`. Metadata frames (`usage_update
 updates, `checkpoint`/`command`) may update `observed_phase` and `last_transport_event_at` as
 evidence, but a periodic usage/idle heartbeat **never** counts as progress and can never clear a
 stall. Values are per message: a new message resets `last_progress_at`/`observed_phase` rather than
-inheriting the previous message's. Polling `message_status`, `ping`, or `live_output`, and
+inheriting the previous message's. Polling `message_status` or `ping`, and
 lifecycle/persistence work, **never** refresh these. A hint is only a hint: the server does not
 auto-cancel a silent message, and the absolute `timeouts.turn_timeout_seconds` still governs the
 hard deadline.
@@ -170,33 +216,14 @@ closes stdout while its process stays alive — the running message converges to
 EOF. `close_session`, `session_shutdown`, a supervisor/harness exit, and a server restart converge
 the same way (`session_interrupted` across a restart).
 
-## Live output, cursors, and SSE
+## Progress snapshots
 
-```json
-{ "session_id": "<session>", "message_id": "<message>", "limit": 100, "wait_ms": 15000 }
-```
-
-The response data contains `events`, `next_cursor`, `has_more`, `session_closed`, and `terminal`.
-Pass `next_cursor` unchanged as the next request's `cursor`. Cursors bind to the session and
-optional message filter; changing either invalidates the cursor. They contain the raw-file
-byte position and position within a rendered event, and survive process restarts.
-
-`limit` counts returned event fragments, from 1 to `buffers.preview_page_events`.
-Large text is split at UTF-8 boundaries according to `buffers.preview_text_bytes`;
-`complete: false` means the same event continues on the next fragment. Join matching
-`seq`/`type` text fragments in order. The cursor also handles multiple rendered events
-from a single tool record. Polling never loses older output to preview-window eviction.
-
-`wait_ms` ranges from 0 to 60000. At EOF a live session can wait for an append, disconnect,
-or deadline. Always drain `has_more`, even when `terminal` is true. Without `message_id`,
-`terminal` means session closure; with it, it means message completion.
-
-To stream, POST the same JSON with **`Accept: text/event-stream`**. Each `event: output`
-contains a JSON `{ "ok": true, "data": <page> }` envelope and its next cursor as the SSE
-`id`. Reconnect by POSTing that cursor in the body. Use a POST-capable streaming client
-such as fetch; browser `EventSource` only supports GET. The stream ends after terminal
-output is drained, or on disconnect. Errors after stream headers use `event: error` with
-a JSON error envelope; earlier errors remain ordinary JSON HTTP responses.
+There is no public live-output endpoint and no SSE stream. A running message's `message_status`
+carries an optional `progress` object — `{text, reasoning, tool_calls}` — that is bounded by
+`buffers.preview_text_bytes` and sanitized through the same redactor as the persisted journal.
+It is a snapshot (replace, not append) intended only for a UI preview; terminal messages drop it
+and expose the complete `result` instead. The journal (`raw.jsonl`) remains the authoritative,
+lossless record.
 
 ## Session files
 
@@ -234,6 +261,6 @@ npm run check
 
 Tests exercise built HTTP endpoints, real supervisor/child processes with a fake ACP harness,
 wire preservation, session state transitions, reverse questions, deadlines, journal recovery,
-UTF-8 cursor pagination, and SSE. Docker/SSH launch tests use local shims, not a real host,
-container engine, or paid model. The server's old Unix-socket clients in sibling projects
-require a separate HTTP migration.
+interactive authentication flows, and UTF-8-safe persisted results. Docker/SSH launch tests use
+local shims, not a real host, container engine, or paid model. The server's old Unix-socket
+clients in sibling projects require a separate HTTP migration.

@@ -104,14 +104,21 @@ function strictUtf8(buffer: Buffer): string | null {
  * kept in memory only and never written to disk.
  */
 export class Redactor {
-  readonly secrets: readonly string[];
-  constructor(secrets: readonly string[] = []) { this.secrets = normalizeSecrets(secrets); }
-  text(value: string): string { return redactText(value, this.secrets); }
-  value<T>(value: T): T { return redactValue(value, this.secrets); }
-  bytes(buffer: Buffer): Buffer { return redactBytes(buffer, this.secrets); }
+  private secretList: string[];
+  constructor(secrets: readonly string[] = []) { this.secretList = normalizeSecrets(secrets); }
+  get secrets(): readonly string[] { return this.secretList; }
+  /**
+   * Register additional literal secret values discovered at runtime (e.g. an auth answer's token).
+   * Masking is by value, so it is scoped to the real bytes without over-redacting ordinary fields
+   * that merely share a name such as `code`/`response`.
+   */
+  addSecrets(values: readonly string[]): void { this.secretList = normalizeSecrets([...this.secretList, ...values]); }
+  text(value: string): string { return redactText(value, this.secretList); }
+  value<T>(value: T): T { return redactValue(value, this.secretList); }
+  bytes(buffer: Buffer): Buffer { return redactBytes(buffer, this.secretList); }
   /** A bounded, cross-chunk redactor for streamed diagnostics (stderr, oversized fragments). */
   stream(charset: "utf8" | "latin1" = "utf8"): StreamRedactor {
-    return new StreamRedactor(this.secrets, charset);
+    return new StreamRedactor(this.secretList, charset);
   }
 }
 

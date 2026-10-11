@@ -585,11 +585,12 @@ node "$SOP/scripts/bridge-call.mjs" send_message \
 ```bash
 node "$SOP/scripts/bridge-call.mjs" message_result \
   "{\"session_id\":\"$SESSION\",\"message_id\":\"$MESSAGE\"}"
-node "$SOP/scripts/bridge-call.mjs" live_output \
-  "{\"session_id\":\"$SESSION\",\"message_id\":\"$MESSAGE\",\"offset\":0,\"max_bytes\":65536}"
+node "$SOP/scripts/bridge-call.mjs" message_status \
+  "{\"session_id\":\"$SESSION\",\"message_id\":\"$MESSAGE\"}"
 ```
 
-后续预览使用返回的 `next_offset`，不反复从 0 读取。
+`message_status` 在消息运行时会附带一个受限的 `progress` 预览快照（`{text, reasoning, tool_calls}`），
+它是替换式的快照而非追加；完成后再读取 `result`。原始日志以 `raw.jsonl` 为准。
 
 **三层状态必须分开：**
 

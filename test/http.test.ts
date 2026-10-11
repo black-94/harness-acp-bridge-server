@@ -31,6 +31,7 @@ async function setup(settings: Record<string, unknown> = {}, flags: string[] = [
     const response = await request("create_session", { cwd: directory, model_id: "fake-model" });
     expect(response.ok, JSON.stringify(response)).toBe(true); return response.data.session_id as string;
   };
+  const createRaw = (params: Record<string, unknown> = {}) => request("create_session", { cwd: directory, model_id: "fake-model", ...params });
   const complete = async (session: string, message: string) => {
     const end = Date.now() + 4000;
     while (Date.now() < end) {
@@ -40,22 +41,42 @@ async function setup(settings: Record<string, unknown> = {}, flags: string[] = [
     }
     throw new Error("message did not become terminal");
   };
-  return { server, config, directory, base, request, create, complete };
+  return { server, config, directory, base, request, create, createRaw, complete };
 }
-async function pageAll(request: (method: string, params?: Record<string, unknown>) => Promise<any>, session: string, message?: string) {
-  const events: any[] = []; let cursor: string | undefined;
-  for (let count = 0; count < 1000; count++) {
-    const response = await request("live_output", { session_id: session, ...(message ? { message_id: message } : {}), cursor, limit: 2 });
-    expect(response.ok, JSON.stringify(response)).toBe(true);
-    events.push(...response.data.events); cursor = response.data.next_cursor;
-    if (!response.data.has_more) return { events, cursor };
+/** A full auth timeouts block wide enough for multi-round interactive login tests. */
+const AUTH_TIMEOUTS = {
+  startup_timeout_seconds: 3, request_timeout_seconds: 2, turn_timeout_seconds: 5,
+  authentication_timeout_seconds: 5, input_timeout_seconds: 4,
+  turn_cancel_timeout_seconds: 0.3, terminate_grace_seconds: 0.05, remote_cleanup_timeout_seconds: 0.05,
+};
+/** Poll `auth_status` until `predicate` holds, returning the final snapshot. */
+async function waitAuth(request: (method: string, params?: Record<string, unknown>) => Promise<any>, session: string, predicate: (snapshot: any) => boolean) {
+  const end = Date.now() + 4000;
+  let snapshot: any;
+  while (Date.now() < end) {
+    snapshot = (await request("auth_status", { session_id: session })).data;
+    if (snapshot && predicate(snapshot)) return snapshot;
+    await new Promise(resolve => setTimeout(resolve, 10));
   }
-  throw new Error("pagination failed to advance");
+  throw new Error(`auth never satisfied predicate: ${JSON.stringify(snapshot)}`);
+}
+/** The method-selection question of a flow snapshot. */
+const methodQuestion = (snapshot: any) => (snapshot.questions ?? []).find((question: any) => question.schema?.properties?.method_id);
+/** Wait for the next non-selection auth question (a token/browser reverse request). */
+async function nextAuthQuestion(request: (method: string, params?: Record<string, unknown>) => Promise<any>, session: string) {
+  const end = Date.now() + 4000;
+  while (Date.now() < end) {
+    const snapshot = (await request("auth_status", { session_id: session })).data;
+    const question = (snapshot.questions ?? []).find((candidate: any) => !candidate.schema?.properties?.method_id);
+    if (question) return question;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error("no auth question arrived");
 }
 describe("HTTP server contract and session state machine", () => {
   it("accepts only POST JSON and searches configuration without starting a harness", async () => {
     const app = await setup();
-    const ping = await app.request("ping"); expect(ping.data.sessions).toBe(0);
+    const ping = await app.request("ping"); expect(ping.data.sessions).toBe(0); expect(ping.data.protocol_version).toBe(3);
     const found = await app.request("search_harness"); expect(found.data.harnesses.codebuddy.models[0].id).toBe("fake-model");
     expect((await app.request("ping")).data.sessions).toBe(0);
     expect((await fetch(`${app.base}/api/ping`)).status).toBe(405);
@@ -83,9 +104,6 @@ describe("HTTP server contract and session state machine", () => {
     expect(raw.some(event => event.event === "message_finished")).toBe(true);
     expect(raw.map(event => event.seq)).toEqual(raw.map((_, index) => index + 1));
     expect((await app.request("message_status", { session_id: session, message_id: submitted.data.message_id })).data.result).toEqual(result.result);
-    const preview = await pageAll(app.request, session, submitted.data.message_id);
-    expect(preview.events.filter(event => event.type === "reasoning").map(event => event.text).join("")).toBe("正在分析问题😀");
-    expect(preview.events.some(event => event.type === "tool_output" && event.text === "工具输出结果")).toBe(true);
   });
   it("rejects busy operations and permits cancel then send for steering", async () => {
     const app = await setup(); const session = await app.create();
@@ -112,10 +130,10 @@ describe("HTTP server contract and session state machine", () => {
     const app = await setup(); const session = await app.create();
     for (const text of ["unknown-notice", "unknown-request"]) {
       const message = (await app.request("send_message", { session_id: session, text })).data.message_id;
-      expect((await app.complete(session, message)).state).toBe("completed");
-      const preview = await pageAll(app.request, session, message);
-      expect(preview.events.some(event => event.type === "unsupported" && event.text.includes("vendor/"))).toBe(true);
-      expect(preview.events.some(event => event.type === "answer" && event.text.includes("after-"))).toBe(true);
+      const result = await app.complete(session, message);
+      expect(result.state).toBe("completed");
+      // An unrecognized frame does not stop the turn; the following answer chunk still lands.
+      expect(result.result.text).toContain("after-");
     }
     const stdout = readFileSync(join(app.config.paths.sessionDir, session, "raw.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(event => event.stream === "stdout").map(event => Buffer.from(event.raw, "base64").toString("utf8")).join("");
     // The on-disk copy redacts the sensitive `token` field, but keeps every ordinary byte of the
@@ -179,18 +197,27 @@ describe("HTTP server contract and session state machine", () => {
     expect(result.data.terminal).toBe(true); expect(result.data.error.code).toBe("cancel_timeout");
     expect((await app.request("send_message", { session_id: session, text: "next" })).error.code).toBe("session_closed");
   });
-  it("long polls for output and streams SSE pages with reconnectable cursors", async () => {
+  it("removed the public live_output endpoint", async () => {
     const app = await setup(); const session = await app.create();
-    const initial = await pageAll(app.request, session);
-    const pending = app.request("live_output", { session_id: session, cursor: initial.cursor, wait_ms: 1000 });
-    setTimeout(() => { void app.request("send_message", { session_id: session, text: "live" }); }, 30);
-    expect((await pending).data.events.length).toBeGreaterThan(0);
-    const response = await fetch(`${app.base}/api/live_output`, { method: "POST", headers: { "content-type": "application/json", accept: "text/event-stream" }, body: JSON.stringify({ session_id: session, cursor: initial.cursor, limit: 2 }) });
-    expect(response.headers.get("content-type")).toContain("text/event-stream");
-    const reader = response.body!.getReader();
-    const frame = new TextDecoder().decode((await reader.read()).value);
-    expect(frame).toContain("event: output"); expect(frame).toContain("id: ");
-    await reader.cancel();
+    const response = await app.request("live_output", { session_id: session, cursor: "0", limit: 2 });
+    expect(response.status).toBe(404);
+    expect(response.error.code).toBe("unsupported_request");
+    await app.request("close_session", { session_id: session });
+  });
+  it("exposes a bounded sanitized progress snapshot while a message runs", async () => {
+    const app = await setup(); const session = await app.create();
+    const message = (await app.request("send_message", { session_id: session, text: "HANG" })).data.message_id;
+    let snapshot: any;
+    for (let index = 0; index < 200; index++) {
+      snapshot = (await app.request("message_status", { session_id: session, message_id: message })).data;
+      if (snapshot.progress?.text?.includes("echo:HANG")) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    expect(snapshot.terminal).toBe(false);
+    expect(snapshot.progress.text).toContain("echo:HANG");
+    expect(snapshot.progress).toHaveProperty("reasoning");
+    expect(Array.isArray(snapshot.progress.tool_calls)).toBe(true);
+    await app.request("cancel_message", { session_id: session, message_id: message });
     await app.request("close_session", { session_id: session });
   });
   it("times out a message by cancelling it, and enforces question deadlines", async () => {
@@ -208,11 +235,19 @@ describe("HTTP server contract and session state machine", () => {
   it("bounds handshake, authentication, and ordinary request waits", async () => {
     const handshake = await setup({ timeouts: { startup_timeout_seconds: 0.15, terminate_grace_seconds: 0.05 } }, ["--handshake-hang"]);
     expect((await handshake.request("create_session", { cwd: handshake.directory, model_id: "fake-model" })).error.code).toBe("handshake_timeout");
-    const auth = await setup({}, ["--auth-hang"]);
-    const session = await auth.create();
-    const failed = await auth.request("authenticate", { session_id: session, method_id: "api-key" });
-    expect(failed.error?.code ?? failed.data?.status).toMatch(/authentication_(timeout|timed_out)/);
-    expect((await auth.request("send_message", { session_id: session, text: "x" })).error.code).toBe("session_closed");
+    const auth = await setup({ timeouts: { ...AUTH_TIMEOUTS, authentication_timeout_seconds: 0.3 } }, ["--auth-hang"]);
+    const created = await auth.createRaw();
+    const session = created.error.detail.session_id as string;
+    const started = await auth.request("authenticate", { session_id: session });
+    const answered = await auth.request("answer_question", { session_id: session, request_id: methodQuestion(started.data).request_id, content: { method_id: "api-key" } });
+    expect(answered.data.state).toBe("authenticating");
+    // The auth deadline closes the half-authenticated session, which can never be reused.
+    let closed = false;
+    for (let index = 0; index < 200; index++) {
+      if ((await auth.request("send_message", { session_id: session, text: "x" })).error?.code === "session_closed") { closed = true; break; }
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    expect(closed).toBe(true);
     const app = await setup({ timeouts: { request_timeout_seconds: 0.1, terminate_grace_seconds: 0.05 } }, [], "codex");
     const other = await app.create();
     const message = (await app.request("send_message", { session_id: other, text: "arm-options-hang" })).data.message_id;
@@ -220,15 +255,217 @@ describe("HTTP server contract and session state machine", () => {
     expect((await app.request("set_session_options", { session_id: other, model_id: "fake-model-2" })).error.code).toBe("request_timeout");
     expect((await app.request("send_message", { session_id: other, text: "x" })).error.code).toBe("session_closed");
   });
-  it("reports unknown auth probes as unsupported with original content, and authenticates when supported", async () => {
+  it("reports unknown auth probes as unsupported, and drives a live flow to ready", async () => {
     const unknown = await setup({}, [], "codex"); const session = await unknown.create();
     const status = await unknown.request("auth_status", { session_id: session });
     expect(status.status).toBe(501); expect(status.error.code).toBe("unsupported_response"); expect(status.error.detail.raw.raw).toContain("unsupported");
-    const app = await setup({}, ["--auth-required"]); const other = await app.create();
-    expect((await app.request("send_message", { session_id: other, text: "x" })).error.code).toBe("authentication_required");
-    expect((await app.request("auth_status", { session_id: other })).data.authenticated).toBe(false);
-    expect((await app.request("authenticate", { session_id: other, method_id: "api-key" })).data.status).toBe("ready");
+    const app = await setup({ timeouts: AUTH_TIMEOUTS }, ["--auth-required"]);
+    const created = await app.createRaw();
+    expect(created.status).toBe(403);
+    expect(created.error.code).toBe("authentication_required");
+    const other = created.error.detail.session_id as string;
+    expect(created.error.detail.next_action).toEqual({ method: "authenticate", params: { session_id: other } });
+    // create_session keeps the session alive; it is only reported as unauthenticated.
+    const before = await app.request("auth_status", { session_id: other });
+    expect(before.data.authenticated).toBe(false);
+    const started = await app.request("authenticate", { session_id: other });
+    expect(started.data.state).toBe("waiting_input");
+    expect(started.data.terminal).toBe(false);
+    const answered = await app.request("answer_question", { session_id: other, request_id: methodQuestion(started.data).request_id, content: { method_id: "api-key" } });
+    expect(answered.data.state).toBe("authenticating");
+    const ready = await waitAuth(app.request, other, snapshot => snapshot.state === "ready");
+    expect(ready.authenticated).toBe(true);
+    expect(ready.terminal).toBe(true);
     expect((await app.request("auth_status", { session_id: other })).data.authenticated).toBe(true);
+  });
+  it("closes an unauthenticated session without blocking on login", async () => {
+    const app = await setup({ timeouts: AUTH_TIMEOUTS }, ["--auth-required"]);
+    const created = await app.createRaw(); const session = created.error.detail.session_id as string;
+    const closed = await app.request("close_session", { session_id: session });
+    expect(closed.ok).toBe(true);
+    expect(closed.data.state).toBe("closed");
+    expect((await app.request("authenticate", { session_id: session })).error.code).toBe("session_closed");
+  });
+  it("restarts a finished flow instead of replaying it, without duplicating questions", async () => {
+    const app = await setup({ timeouts: AUTH_TIMEOUTS }, ["--auth-required"]);
+    const created = await app.createRaw(); const session = created.error.detail.session_id as string;
+    const first = await app.request("authenticate", { session_id: session });
+    const cancelled = await app.request("answer_question", { session_id: session, request_id: methodQuestion(first.data).request_id, answer: "cancel" });
+    expect(cancelled.data.state).toBe("cancelled");
+    expect(cancelled.data.terminal).toBe(true);
+    const again = await app.request("authenticate", { session_id: session });
+    expect(again.data.state).toBe("waiting_input");
+    expect(methodQuestion(again.data).request_id).not.toBe(methodQuestion(first.data).request_id);
+  });
+  it("requires an explicit method choice and lists unsupported candidates", async () => {
+    const app = await setup({ timeouts: AUTH_TIMEOUTS }, ["--auth-methods"]);
+    const created = await app.createRaw(); const session = created.error.detail.session_id as string;
+    const started = await app.request("authenticate", { session_id: session });
+    const candidates = started.data.candidates;
+    expect(candidates.map((candidate: any) => candidate.id)).toEqual(["api-key", "token", "approve", "device", "browser", "codes", "client-code"]);
+    const unsupported = candidates.find((candidate: any) => candidate.id === "client-code");
+    expect(unsupported.supported).toBe(false);
+    expect(unsupported.type).toBe("client");
+    expect(unsupported.description).toContain("Not supported in harness_acp_bridge");
+    const question = methodQuestion(started.data);
+    expect(question.schema.properties.method_id.enum).toEqual(["api-key", "token", "approve", "device", "browser", "codes"]);
+    expect((await app.request("answer_question", { session_id: session, request_id: question.request_id, content: { method_id: "client-code" } })).error.code).toBe("unsupported_authentication");
+    expect((await app.request("answer_question", { session_id: session, request_id: question.request_id, content: { method_id: "nope" } })).error.code).toBe("invalid_option");
+    expect((await app.request("answer_question", { session_id: session, request_id: question.request_id, content: { method_id: "api-key" } })).data.state).toBe("authenticating");
+    await waitAuth(app.request, session, snapshot => snapshot.state === "ready");
+  });
+  it("completes a multi-round information/token login only on real harness success", async () => {
+    const app = await setup({ timeouts: AUTH_TIMEOUTS }, ["--auth-methods"]);
+    const created = await app.createRaw(); const session = created.error.detail.session_id as string;
+    const started = await app.request("authenticate", { session_id: session });
+    await app.request("answer_question", { session_id: session, request_id: methodQuestion(started.data).request_id, content: { method_id: "token" } });
+    const first = await nextAuthQuestion(app.request, session);
+    expect(first.title).toBe("Choose account");
+    // schema validation is enforced before the answer reaches the harness
+    expect((await app.request("answer_question", { session_id: session, request_id: first.request_id, content: {} })).error.code).toBe("invalid_answer");
+    await app.request("answer_question", { session_id: session, request_id: first.request_id, content: { account: "me" } });
+    const second = await nextAuthQuestion(app.request, session);
+    expect(second.title).toBe("Enter token");
+    await app.request("answer_question", { session_id: session, request_id: second.request_id, content: { token: "a-secret-token" } });
+    const ready = await waitAuth(app.request, session, snapshot => snapshot.state === "ready");
+    expect(ready.authenticated).toBe(true);
+  });
+  it("adapts a Codex device-code URL elicitation into a browser question", async () => {
+    const app = await setup({ timeouts: AUTH_TIMEOUTS }, ["--auth-methods"], "codex");
+    const created = await app.createRaw(); const session = created.error.detail.session_id as string;
+    const started = await app.request("authenticate", { session_id: session });
+    await app.request("answer_question", { session_id: session, request_id: methodQuestion(started.data).request_id, content: { method_id: "device" } });
+    const question = await nextAuthQuestion(app.request, session);
+    // Both the machine code (from the harness message) and the full verification URL are present.
+    expect(question.message).toContain("ABCD-1234");
+    expect(question.message).toContain("https://example.test/device");
+    expect(question.schema.properties.opened.enum).toEqual([true]);
+    await app.request("answer_question", { session_id: session, request_id: question.request_id, content: { opened: true } });
+    expect((await waitAuth(app.request, session, snapshot => snapshot.state === "ready")).authenticated).toBe(true);
+  });
+  it("adapts an Agy stderr login URL and keeps a confirmation from faking success", async () => {
+    const app = await setup({ timeouts: AUTH_TIMEOUTS }, ["--auth-methods"], "agy");
+    const created = await app.createRaw(); const session = created.error.detail.session_id as string;
+    const started = await app.request("authenticate", { session_id: session });
+    await app.request("answer_question", { session_id: session, request_id: methodQuestion(started.data).request_id, content: { method_id: "browser" } });
+    const question = await nextAuthQuestion(app.request, session);
+    expect(question.message).toBe("https://example.test/oauth");
+    expect(question.schema.properties.opened.enum).toEqual([true]);
+    const acked = await app.request("answer_question", { session_id: session, request_id: question.request_id, content: { opened: true } });
+    // Acknowledging the browser step is not the login; the harness has not confirmed yet.
+    expect(acked.data.state).toBe("authenticating");
+    expect(acked.data.terminal).toBe(false);
+    expect((await waitAuth(app.request, session, snapshot => snapshot.state === "ready")).authenticated).toBe(true);
+  });
+  it("runs a permission-then-information auth loop, answering the permission with an option and no content", async () => {
+    const app = await setup({ timeouts: AUTH_TIMEOUTS }, ["--auth-methods"]);
+    const created = await app.createRaw(); const session = created.error.detail.session_id as string;
+    const started = await app.request("authenticate", { session_id: session });
+    await app.request("answer_question", { session_id: session, request_id: methodQuestion(started.data).request_id, content: { method_id: "approve" } });
+    const permission = await nextAuthQuestion(app.request, session);
+    expect(permission.kind).toBe("permission");
+    // An unoffered option is rejected and the question stays pending.
+    expect((await app.request("answer_question", { session_id: session, request_id: permission.request_id, option_id: "not-offered" })).error.code).toBe("invalid_option");
+    expect((await app.request("auth_status", { session_id: session })).data.questions).toHaveLength(1);
+    // The permission is answered with an offered option and NO content.
+    const answered = await app.request("answer_question", { session_id: session, request_id: permission.request_id, option_id: "allow_once" });
+    expect(answered.ok, JSON.stringify(answered)).toBe(true);
+    const info = await nextAuthQuestion(app.request, session);
+    expect(info.title).toBe("Choose account");
+    await app.request("answer_question", { session_id: session, request_id: info.request_id, content: { account: "me" } });
+    expect((await waitAuth(app.request, session, snapshot => snapshot.state === "ready")).authenticated).toBe(true);
+  });
+  it("opens an externally completed login without a credential write or a rate charge", async () => {
+    const app = await setup({ timeouts: AUTH_TIMEOUTS }, ["--external-auth"]);
+    const authFile = join(app.directory, "auth-calls.txt");
+    vi.stubEnv("FAKE_HARNESS_AUTH_FILE", authFile);
+    const created = await app.createRaw();
+    expect(created.error.code).toBe("authentication_required");
+    const session = created.error.detail.session_id as string;
+    // The login completes outside the bridge (status probe flips to authenticated); no session yet.
+    await new Promise(resolve => setTimeout(resolve, 350));
+    expect((await app.request("auth_status", { session_id: session })).data.authenticated).toBe(true);
+    const started = await app.request("authenticate", { session_id: session });
+    expect(started.data.state).toBe("authenticating");
+    // No method question: the credentials already exist, only the session is opened.
+    expect(started.data.questions).toEqual([]);
+    expect((await waitAuth(app.request, session, snapshot => snapshot.state === "ready")).authenticated).toBe(true);
+    // The harness `authenticate` RPC (the credential write) was never called.
+    expect(existsSync(authFile)).toBe(false);
+  });
+  it("keeps auth answer values exact on the wire but never persists them", async () => {
+    const app = await setup({ timeouts: AUTH_TIMEOUTS }, ["--auth-methods"]);
+    const answerFile = join(app.directory, "answers.jsonl");
+    vi.stubEnv("FAKE_HARNESS_ANSWER_FILE", answerFile);
+    const created = await app.createRaw(); const session = created.error.detail.session_id as string;
+    const started = await app.request("authenticate", { session_id: session });
+    await app.request("answer_question", { session_id: session, request_id: methodQuestion(started.data).request_id, content: { method_id: "codes" } });
+    const question = await nextAuthQuestion(app.request, session);
+    expect(question.title).toBe("Credential codes");
+    // Schema constraints are enforced before the answer reaches the harness.
+    expect((await app.request("answer_question", { session_id: session, request_id: question.request_id, content: { code: "xy" } })).error.code).toBe("invalid_answer");
+    expect((await app.request("answer_question", { session_id: session, request_id: question.request_id, content: { code: "CODE-123456", bogus: "x" } })).error.code).toBe("invalid_answer");
+    const sentinels = { code: "CODE-SENTINEL-AAAA", response: "RESP-SENTINEL-BBBB", answer: "ANS-SENTINEL-CCCC" };
+    await app.request("answer_question", { session_id: session, request_id: question.request_id, content: sentinels });
+    await waitAuth(app.request, session, snapshot => snapshot.state === "ready");
+    await new Promise(resolve => setTimeout(resolve, 40));
+    // The harness received the ORIGINAL bytes.
+    const received = readFileSync(answerFile, "utf8");
+    for (const value of Object.values(sentinels)) expect(received).toContain(value);
+    // No snapshot retains the answers.
+    const snapshot = JSON.stringify((await app.request("auth_status", { session_id: session })).data);
+    for (const value of Object.values(sentinels)) expect(snapshot).not.toContain(value);
+    // The on-disk journal is masked by value.
+    const journal = readFileSync(join(app.config.paths.sessionDir, session, "raw.jsonl"), "utf8");
+    for (const value of Object.values(sentinels)) expect(journal).not.toContain(value);
+  });
+  it("refuses a nonstandard authenticate result instead of reporting success", async () => {
+    const app = await setup({ timeouts: AUTH_TIMEOUTS }, ["--auth-required", "--auth-result-false"]);
+    const created = await app.createRaw(); const session = created.error.detail.session_id as string;
+    const started = await app.request("authenticate", { session_id: session });
+    await app.request("answer_question", { session_id: session, request_id: methodQuestion(started.data).request_id, content: { method_id: "api-key" } });
+    const failed = await waitAuth(app.request, session, snapshot => snapshot.terminal === true);
+    expect(failed.state).toBe("failed");
+    expect(failed.error.code).toBe("authentication_failed");
+    expect((await app.request("send_message", { session_id: session, text: "x" })).error.code).toBe("authentication_required");
+  });
+  it("attaches the real session_id and next_action to a synchronous adapter auth error", async () => {
+    const app = await setup({ timeouts: AUTH_TIMEOUTS }, ["--set-model-auth-32000"]);
+    const session = await app.create();
+    const result = await app.request("set_session_options", { session_id: session, model_id: "fake-model-2" });
+    expect(result.status).toBe(403);
+    expect(result.error.code).toBe("authentication_required");
+    expect(result.error.detail.session_id).toBe(session);
+    expect(result.error.detail.next_action).toEqual({ method: "authenticate", params: { session_id: session } });
+  });
+  it("keeps an initialized harness usable when the setup auth probe reports ACP -32000", async () => {
+    const app = await setup({ timeouts: AUTH_TIMEOUTS }, ["--status-auth-32000"]);
+    const created = await app.createRaw();
+    expect(created.status).toBe(403);
+    expect(created.error.code).toBe("authentication_required");
+    const session = created.error.detail.session_id as string;
+    expect(session).toBeTruthy();
+    // The session stayed initialized (not closed): authenticate can finish it.
+    const started = await app.request("authenticate", { session_id: session });
+    expect(started.data.state).toBe("waiting_input");
+    await app.request("answer_question", { session_id: session, request_id: methodQuestion(started.data).request_id, content: { method_id: "api-key" } });
+    expect((await waitAuth(app.request, session, snapshot => snapshot.state === "ready")).authenticated).toBe(true);
+  });
+  it("exposes a terminal flow or a clear session_closed after a flow ends, never a stale input loop", async () => {
+    const app = await setup({ timeouts: AUTH_TIMEOUTS }, ["--auth-methods"]);
+    const created = await app.createRaw(); const session = created.error.detail.session_id as string;
+    const started = await app.request("authenticate", { session_id: session });
+    const cancelled = await app.request("answer_question", { session_id: session, request_id: methodQuestion(started.data).request_id, answer: "cancel" });
+    expect(cancelled.data.terminal).toBe(true);
+    const status = await app.request("auth_status", { session_id: session });
+    expect(status.ok).toBe(true);
+    expect(status.data.terminal).toBe(true);
+    expect(status.data.questions).toEqual([]);
+    // After a hard close the same contract holds: terminal flow if still available, else session_closed.
+    await app.request("close_session", { session_id: session });
+    const after = await app.request("auth_status", { session_id: session });
+    if (after.ok) { expect(after.data.terminal).toBe(true); expect(after.data.questions).toEqual([]); }
+    else expect(after.error.code).toBe("session_closed");
   });
   it("reaps only idle sessions and applies a live-session concurrency bound", async () => {
     // A wider idle window keeps the setup round trips from racing the reaper on a loaded machine;
@@ -242,21 +479,6 @@ describe("HTTP server contract and session state machine", () => {
     await app.request("cancel_message", { session_id: session, message_id: message });
     await new Promise(resolve => setTimeout(resolve, 700));
     expect((await app.request("send_message", { session_id: session, text: "after-idle" })).error.code).toBe("session_closed");
-  });
-  it("removes long-poll listeners after caller disconnect, and ends a message SSE stream at terminal", async () => {
-    const app = await setup(); const session = await app.create(); const initial = await pageAll(app.request, session);
-    const controller = new AbortController();
-    const pending = fetch(`${app.base}/api/live_output`, { method: "POST", signal: controller.signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ session_id: session, cursor: initial.cursor, wait_ms: 60000 }) }).catch(() => null);
-    await new Promise(resolve => setTimeout(resolve, 30));
-    controller.abort(); await pending; await new Promise(resolve => setTimeout(resolve, 30));
-    expect(app.server.service.sessions.get(session)!.store.listenerCount("append")).toBe(0);
-    const message = (await app.request("send_message", { session_id: session, text: "SSE-finish😀" })).data.message_id;
-    await app.complete(session, message);
-    const response = await fetch(`${app.base}/api/live_output`, { method: "POST", headers: { "content-type": "application/json", accept: "text/event-stream" }, body: JSON.stringify({ session_id: session, message_id: message, limit: 1 }) });
-    const frames = await response.text();
-    const events = frames.split("\n").filter(line => line.startsWith("data: ")).flatMap(line => JSON.parse(line.slice(6)).data.events);
-    expect(events.filter(event => event.type === "answer").map(event => event.text).join("")).toBe("echo:SSE-finish😀");
-    expect(frames).toContain('"terminal":true');
   });
   it("returns a JSON 413 for oversized HTTP bodies", async () => {
     const app = await setup({ server: { host: "127.0.0.1", port: 0, max_body_bytes: 32 } });

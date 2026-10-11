@@ -5,24 +5,20 @@ import { join } from "node:path";
 import { AuthCoordinator, AuthLedger } from "../auth.js";
 import { harnessInfo, type BridgeConfig } from "../config.js";
 import { assertAllowedKeys, normalizeCreateParams } from "../create-params.js";
-import { BridgeError, isRecord } from "../errors.js";
+import { authenticationRequired, BridgeError, isRecord } from "../errors.js";
 import { isValidSessionId, newSessionId, QUEUE_FILE, RAW_FILE, readJsonFileSafe, RESULTS_DIR, SESSION_FILE, sessionDirectory, writeJsonAtomicSync } from "../persistence.js";
-import { readPreview } from "../preview/reader.js";
 import { Redactor, collectSecrets } from "../redact.js";
 import { HarnessSession } from "./session.js";
 
-export const METHODS = ["ping", "search_harness", "create_session", "close_session", "authenticate", "auth_status", "set_session_options", "send_message", "cancel_message", "message_status", "live_output", "answer_question"] as const;
+export const METHODS = ["ping", "search_harness", "create_session", "close_session", "authenticate", "auth_status", "set_session_options", "send_message", "cancel_message", "message_status", "answer_question"] as const;
+/** Bumped when the public HTTP contract changes incompatibly (interactive auth, no live_output). */
+export const PROTOCOL_VERSION = 3;
 export interface RequestContext { signal?: AbortSignal }
 function string(params: Record<string, unknown>, key: string, optional = false, opaque = false): string | null {
   const value = params[key];
   if (optional && (value === undefined || value === null)) return null;
   if (typeof value !== "string" || !value.trim()) throw new BridgeError("invalid_param", `${key} must be a non-empty string`);
   return opaque ? value : value.trim();
-}
-function integer(value: unknown, fallback: number, min: number, max: number, name: string): number {
-  if (value === undefined) return fallback;
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min || value > max) throw new BridgeError("invalid_param", `${name} must be an integer between ${min} and ${max}`);
-  return value;
 }
 export class HarnessService {
   readonly sessions = new Map<string, HarnessSession>();
@@ -36,6 +32,7 @@ export class HarnessService {
     this.redactor = new Redactor(collectSecrets(process.env, config.harnesses));
     this.auth = new AuthCoordinator({ ledger: new AuthLedger({ path: config.authentication.ledgerPath, rateLimit: config.authentication.rateLimit }),
       maxConcurrentTargets: config.authentication.maxConcurrentTargets, timeoutSeconds: config.timeouts.authenticationTimeoutSeconds,
+      inputTimeoutSeconds: config.timeouts.inputTimeoutSeconds,
       closeSession: async id => { await this.sessions.get(id)?.close(); } });
   }
   start(): void {
@@ -109,7 +106,7 @@ export class HarnessService {
     switch (method) {
       case "ping":
         assertAllowedKeys(params, []);
-        return { status: "ok", protocol_version: 2, pid: process.pid, started_at: new Date(this.startedAt).toISOString(),
+        return { status: "ok", protocol_version: PROTOCOL_VERSION, pid: process.pid, started_at: new Date(this.startedAt).toISOString(),
           uptime_seconds: (Date.now() - this.startedAt) / 1000, sessions: [...this.sessions.values()].filter(session => !session.isClosed).length,
           config_fingerprint: this.config.fingerprint };
       case "search_harness":
@@ -124,23 +121,32 @@ export class HarnessService {
         const session = new HarnessSession(this.config, options, id, this.redactor);
         this.sessions.set(id, session);
         await session.initialize();
-        if (options.authenticate && !session.isAuthenticated()) await this.auth.authenticate(session, options.authenticate);
+        // `create_session.authenticate` no longer exists (it bypassed the flow). An unauthenticated
+        // session stays alive and is reported with a structured next_action instead.
+        if (!session.isAuthenticated()) throw authenticationRequired(id);
         return session.snapshot();
       }
       case "close_session": {
         assertAllowedKeys(params, ["session_id"]);
         const id = string(params, "session_id")!;
         const directory = this.directory(id);
+        // Close always cleans up, even for a session that never authenticated; abandon its flow.
+        await this.auth.cancel(id);
         await this.sessions.get(id)?.close();
         return { session_id: id, state: readJsonFileSafe(join(directory, SESSION_FILE))?.state ?? "closed" };
       }
       case "authenticate": {
-        assertAllowedKeys(params, ["session_id", "method_id"]);
-        return this.auth.authenticate(this.live(string(params, "session_id")!), string(params, "method_id")!);
+        assertAllowedKeys(params, ["session_id"]);
+        return this.auth.start(this.live(string(params, "session_id")!));
       }
       case "auth_status": {
         assertAllowedKeys(params, ["session_id"]);
         const id = string(params, "session_id")!;
+        // A live flow is returned verbatim (read-only, never re-probed) — even after it closed the
+        // session on failure, so the client still learns the terminal outcome. With no flow, keep
+        // the reliable probe and never guess an unsupported status.
+        const flow = this.sessions.get(id) ? this.auth.status(this.sessions.get(id)!) : null;
+        if (flow) return flow;
         const session = this.live(id);
         const info = await session.refreshAuthInfo();
         if (!info) throw new BridgeError("unsupported_response", "harness authentication status is unsupported", session.unsupportedAuthInfo());
@@ -176,49 +182,21 @@ export class HarnessService {
         return this.live(string(params, "session_id")!).cancelMessage(string(params, "message_id")!);
       case "answer_question": {
         assertAllowedKeys(params, ["session_id", "message_id", "request_id", "answer", "option_id", "content"]);
+        const id = string(params, "session_id")!;
+        this.live(id);
         const answer = string(params, "answer", true) ?? "accept";
         if (!["accept", "reject", "timeout", "cancel"].includes(answer)) throw new BridgeError("invalid_param", "answer must be accept, reject, timeout, or cancel");
         if (params.content !== undefined && !isRecord(params.content)) throw new BridgeError("invalid_param", "content must be an object");
-        return this.live(string(params, "session_id")!).answerQuestion(string(params, "message_id")!, string(params, "request_id", false, true)!, answer, string(params, "option_id", true, true), params.content as Record<string, unknown> ?? null);
+        const messageId = string(params, "message_id", true);
+        const requestId = string(params, "request_id", false, true)!;
+        const optionId = string(params, "option_id", true, true);
+        const content = (params.content as Record<string, unknown>) ?? null;
+        // An omitted message_id scopes the answer to the session's authentication flow.
+        if (messageId === null) return this.auth.answer(id, requestId, answer, optionId, content);
+        return this.sessions.get(id)!.answerQuestion(messageId, requestId, answer, optionId, content);
       }
-      case "live_output": return this.liveOutput(params, context);
     }
     throw new BridgeError("unsupported_request", `unsupported method: ${method}`);
-  }
-  private async liveOutput(params: Record<string, unknown>, context: RequestContext): Promise<Record<string, unknown>> {
-    assertAllowedKeys(params, ["session_id", "message_id", "cursor", "limit", "wait_ms"]);
-    const id = string(params, "session_id")!;
-    const directory = this.directory(id);
-    const messageId = string(params, "message_id", true);
-    if (messageId) {
-      if (!isValidSessionId(messageId)) throw new BridgeError("invalid_param", "invalid message_id");
-      if (this.sessions.has(id)) this.sessions.get(id)!.messageStatus(messageId);
-      else if (!readJsonFileSafe(join(directory, RESULTS_DIR, `${messageId}.json`))) throw new BridgeError("message_not_found", "unknown message_id");
-    }
-    const limit = integer(params.limit, Math.min(100, this.config.buffers.previewPageEvents), 1, this.config.buffers.previewPageEvents, "limit");
-    const wait = integer(params.wait_ms, 0, 0, 60000, "wait_ms");
-    let cursor = params.cursor;
-    const read = (): Record<string, unknown> => {
-      const page = readPreview(join(directory, RAW_FILE), id, { cursor, messageId, limit, textBytes: this.config.buffers.previewTextBytes });
-      const snapshot = readJsonFileSafe(join(directory, SESSION_FILE));
-      const closed = ["closed", "failed", "interrupted"].includes(String(snapshot?.state));
-      const message = messageId ? this.sessions.get(id)?.messageStatus(messageId) ?? readJsonFileSafe(join(directory, RESULTS_DIR, `${messageId}.json`)) : null;
-      return { session_id: id, ...page, session_closed: closed, terminal: messageId ? Boolean(message?.terminal) : closed };
-    };
-    if (context.signal?.aborted) throw new BridgeError("request_aborted", "HTTP request disconnected");
-    let page = read();
-    const session = this.sessions.get(id);
-    if (!session || (Array.isArray(page.events) && page.events.length) || page.has_more || page.terminal || !wait) return page;
-    cursor = page.next_cursor;
-    // Install listener without yielding after initial read, so no append wakeup is lost.
-    await new Promise<void>((resolve, reject) => {
-      const finish = (): void => { cleanup(); resolve(); };
-      const abort = (): void => { cleanup(); reject(new BridgeError("request_aborted", "HTTP request disconnected")); };
-      const timer = setTimeout(finish, wait);
-      const cleanup = (): void => { clearTimeout(timer); session.store.off("append", finish); context.signal?.removeEventListener("abort", abort); };
-      session.store.once("append", finish); context.signal?.addEventListener("abort", abort, { once: true });
-    });
-    page = read(); return page;
   }
   /** Restart preserves history, but never reattaches to a stale harness/process. */
   private recover(): void {

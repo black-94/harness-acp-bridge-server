@@ -3,12 +3,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CLIENT_VERSION, ProtocolAdapter, RpcError, type OutputEvent, type Question, type RequestTicket } from "../adapter/protocol.js";
-import { AuthStatusUnsupported, getAdapter, authMethods, type AdapterConfig, type AuthInfo } from "../adapters.js";
-import { authTargetKey } from "../auth.js";
+import { CLIENT_VERSION, ProtocolAdapter, type OutputEvent, type Question, type RequestTicket } from "../adapter/protocol.js";
+import { AuthStatusUnsupported, getAdapter, authMethods, type AdapterConfig, type AuthInfo, type AuthInteraction } from "../adapters.js";
+import { authTargetKey, type AuthCandidate, type AuthPrompt } from "../auth.js";
 import { declaredThinkingLevels, resolveHarness, type BridgeConfig } from "../config.js";
 import { type CreateSessionParams } from "../create-params.js";
-import { BridgeError, deadline, errorInfo, isRecord } from "../errors.js";
+import { authenticationRequired, BridgeError, deadline, errorInfo, isRecord, normalizeError } from "../errors.js";
 import { readJsonFileSafe, SessionStore } from "../persistence.js";
 import { Redactor, collectSecrets } from "../redact.js";
 import { StdioTransport } from "../transport/stdio.js";
@@ -57,6 +57,11 @@ export class HarnessSession {
   private authenticated = false;
   private auth: AuthInfo | null = null;
   private unsupportedAuth: unknown = null;
+  private authQuestionSink: ((prompt: AuthPrompt) => boolean) | null = null;
+  /** Auth questions awaiting revoke, keyed by the harness `elicitationId`. */
+  private readonly authPrompts = new Map<string, AuthPrompt>();
+  private stderrBuffer = "";
+  private readonly redactor: Redactor;
   private messages = new Map<string, Message>();
   private idempotency: Record<string, { hash: string; message_id: string }> = {};
   private active: Message | null = null;
@@ -65,7 +70,7 @@ export class HarnessSession {
   lastActivity = Date.now();
   /**
    * Real harness progress, moved only by ACP output and reverse questions — never by polling
-   * (`message_status`/`ping`/`live_output`), lifecycle journaling, persistence, or the idle
+   * (`message_status`/`ping`), lifecycle journaling, persistence, or the idle
    * reaper. `lastTransportEventAt` tracks any complete stdout frame (including RPC responses);
    * `lastProgressAt` tracks only frames that carry model output or ask for input.
    */
@@ -98,7 +103,8 @@ export class HarnessSession {
       terminateGraceSeconds: config.timeouts.terminateGraceSeconds,
       remoteCleanupTimeoutSeconds: config.timeouts.remoteCleanupTimeoutSeconds,
     };
-    this.store = new SessionStore(config.paths.sessionDir, sessionId, redactor ?? new Redactor(collectSecrets(process.env, config.harnesses)));
+    this.redactor = redactor ?? new Redactor(collectSecrets(process.env, config.harnesses));
+    this.store = new SessionStore(config.paths.sessionDir, sessionId, this.redactor);
     this.metadataPath = join(tmpdir(), `harness-acp-${randomUUID()}.json`);
     this.transport = new StdioTransport(this.store, config.buffers.maxReadBytes);
     this.protocol = new ProtocolAdapter(this.transport, this.adapter);
@@ -110,7 +116,9 @@ export class HarnessSession {
       if (!this.closePromise) void this.close(new BridgeError("transport_closed", "harness exited unexpectedly")).catch(() => undefined);
     });
     this.protocol.on("question", question => this.onQuestion(question));
+    this.protocol.on("question_stale", value => this.onQuestionStale(value));
     this.protocol.on("output", event => this.onOutput(event));
+    this.transport.on("stderr", text => this.onStderr(text));
     this.protocol.on("unsupported", value => {
       this.unsupported.push(value); if (this.unsupported.length > 64) this.unsupported.shift();
       if (this.active) { this.active.unsupported.push(value); if (this.active.unsupported.length > 64) this.active.unsupported.shift(); }
@@ -127,16 +135,25 @@ export class HarnessSession {
     const seconds = method === "initialize" ? this.config.timeouts.startupTimeoutSeconds : method === "authenticate" ? this.config.timeouts.authenticationTimeoutSeconds : this.config.timeouts.requestTimeoutSeconds;
     try { return await deadline(ticket.promise, seconds, method === "initialize" ? "handshake_timeout" : method === "authenticate" ? "authentication_timeout" : "request_timeout"); }
     catch (error) {
-      ticket.abandon(error instanceof Error ? error : new Error(String(error)));
-      if (error instanceof BridgeError && error.code.endsWith("timeout")) await this.close(error);
-      throw error;
+      // Normalize at the session boundary so every explicit auth failure (ACP -32000 / vendor code)
+      // carries the real session_id and a next_action, whatever adapter operation produced it.
+      const normalized = normalizeError(error, this.sessionId);
+      const failure = normalized instanceof Error ? normalized : new Error(String(normalized));
+      ticket.abandon(failure);
+      if (failure instanceof BridgeError && failure.code.endsWith("timeout")) await this.close(failure);
+      throw failure;
     }
   }
   async initialize(): Promise<void> {
     try {
       if (this.spec.reuseContainer) await inspectContainer(this.spec, this.config.timeouts.startupTimeoutSeconds * 1000);
       this.transport.start({ ...this.spec, metadataPath: this.metadataPath, daemonPid: process.pid });
-      await this.request("initialize", { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false }, clientInfo: { name: "harness-acp-bridge", version: CLIENT_VERSION } });
+      await this.request("initialize", { protocolVersion: 1,
+        // `elicitation.form`/`elicitation.url` must be present (non-null) for harnesses such as
+        // codex-acp to surface form questions and the ChatGPT device-code URL elicitation.
+        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false,
+          auth: { terminal: false }, elicitation: { form: {}, url: {} } },
+        clientInfo: { name: "harness-acp-bridge", version: CLIENT_VERSION } });
       const methods = authMethods(this.protocol.initializeResponse);
       if (methods.length) {
         const info = await this.refreshAuthInfo();
@@ -147,8 +164,16 @@ export class HarnessSession {
       this.journal(this.state === "ready" ? "session_ready" : "authentication_required", this.snapshot());
       this.persist();
     } catch (error) {
-      await this.close(error instanceof Error ? error : new Error(String(error)));
-      throw error;
+      const normalized = normalizeError(error, this.sessionId);
+      // A genuine auth-required during setup keeps the initialized harness alive for `authenticate`;
+      // an unrecoverable handshake/transport failure closes it so it is never advertised as usable.
+      if (normalized instanceof BridgeError && normalized.code === "authentication_required") {
+        this.authenticated = false; this.state = "authentication_required"; this.operation = "idle";
+        this.journal("authentication_required", this.snapshot()); this.persist();
+        return;
+      }
+      await this.close(normalized instanceof Error ? normalized : new Error(String(normalized)));
+      throw normalized;
     }
   }
   private async openSession(): Promise<void> {
@@ -158,10 +183,11 @@ export class HarnessSession {
         cwd: this.params.cwd, mcpServers: [], ...(this.params.resumeSessionId ? { sessionId: this.params.resumeSessionId } : {}),
       });
     } catch (error) {
-      if (error instanceof RpcError && /auth|login|credential/i.test(error.message)) {
+      const normalized = normalizeError(error);
+      if (normalized instanceof BridgeError && normalized.code === "authentication_required") {
         this.state = "authentication_required"; this.authenticated = false; return;
       }
-      throw error;
+      throw normalized;
     }
     if (this.isClosed) throw new BridgeError("session_closed", "session closed during initialization");
     await this.adapter.setMode(this.client(), this.adapterConfig, this.protocol.sessionId!);
@@ -203,7 +229,7 @@ export class HarnessSession {
   private touch(): void { this.lastActivity = Date.now(); }
   /**
    * Observed harness activity for a UI hint. Read-only: computing it never advances a timestamp,
-   * so repeated `message_status`/`ping`/`live_output` polls cannot fabricate progress.
+   * so repeated `message_status`/`ping` polls cannot fabricate progress.
    *
    * A running state means "the bridge is still waiting for the ACP prompt result", not "the model
    * is still making progress". `baseline` (a message's submission time) is used only when the
@@ -241,7 +267,7 @@ export class HarnessSession {
   }
   async setOptions(options: { model_id?: string; thinking_level?: string; permission_mode?: CreateSessionParams["permissionMode"] }): Promise<Record<string, unknown>> {
     this.assertIdle();
-    if (this.state !== "ready") throw new BridgeError("authentication_required", "session is not ready");
+    if (this.state !== "ready") throw authenticationRequired(this.sessionId);
     this.assertThinkingLevel(options.model_id ?? this.modelId, options.thinking_level ?? null);
     const nextConfig = { ...this.adapterConfig, permissionMode: options.permission_mode ?? this.permissionMode,
       acpModeId: this.config.launch.agyModeIds[options.permission_mode ?? this.permissionMode] ?? null };
@@ -265,11 +291,28 @@ export class HarnessSession {
       }
       this.journal("session_options_changed", this.options());
       return { session_id: this.sessionId, options: this.options() };
-    } catch (error) { this.journal("session_options_failed", { error: errorInfo(error), effective_options: this.options() }); throw error; }
+    } catch (error) {
+      this.journal("session_options_failed", { error: errorInfo(error), effective_options: this.options() });
+      if (error instanceof BridgeError && error.code === "authentication_required") { this.authenticated = false; this.state = "authentication_required"; }
+      throw error;
+    }
     finally { if (!this.isClosed) this.operation = "idle"; this.persist(); }
   }
   authTargetKey(): string { return authTargetKey(this.adapter.name, this.spec.launchMode, this.spec.sshHost); }
   isAuthenticated(): boolean { return this.authenticated; }
+  /** True only when the harness itself has an open, ready session. */
+  isReady(): boolean { return this.state === "ready" && this.protocol.sessionId !== null; }
+  authCandidates(): AuthCandidate[] {
+    return authMethods(this.protocol.initializeResponse).map(method => {
+      const id = typeof method.id === "string" ? method.id : "";
+      const type = typeof method.type === "string" ? method.type : "agent";
+      const supported = Boolean(id) && type === "agent";
+      const original = typeof method.description === "string" ? method.description.trim() : "";
+      return { id, name: typeof method.name === "string" ? method.name : id, type, supported,
+        ...((original || !supported) ? { description: [original, ...(!supported ? ["Not supported in harness_acp_bridge"] : [])].filter(Boolean).join(" ") } : {}) };
+    });
+  }
+  setAuthQuestionSink(sink: ((prompt: AuthPrompt) => boolean) | null): void { this.authQuestionSink = sink; }
   authInfo(): Record<string, unknown> {
     return { authenticated: this.auth ? this.authenticated : this.authenticated ? true : null,
       supported: this.auth !== null, methods: authMethods(this.protocol.initializeResponse), user: this.auth?.user ?? null };
@@ -295,10 +338,14 @@ export class HarnessSession {
   async authenticate(methodId: string): Promise<unknown> {
     this.assertIdle(); this.operation = "authenticating"; this.touch(); this.journal("authentication_started", { method_id: methodId }); this.persist();
     try {
+      let rpcSucceededWithoutStatus = false;
       try { this.auth = await this.adapter.authenticate(this.client(), methodId); this.authenticated = this.auth.authenticated; }
-      catch (error) { if (!(error instanceof AuthStatusUnsupported)) throw error; this.authenticated = true; }
-      if (!this.authenticated) throw new BridgeError("authentication_failed", "harness is still unauthenticated");
-      await this.openSession(); this.journal("authentication_completed", this.authInfo()); return this.snapshot();
+      catch (error) { if (!(error instanceof AuthStatusUnsupported)) throw error; rpcSucceededWithoutStatus = true; }
+      if (!rpcSucceededWithoutStatus && !this.authenticated) throw new BridgeError("authentication_failed", "harness is still unauthenticated");
+      await this.openSession();
+      if (this.state !== "ready" || !this.protocol.sessionId) throw new BridgeError("authentication_failed", "authentication completed but the harness session is not ready");
+      this.authenticated = true;
+      this.journal("authentication_completed", this.authInfo()); return this.snapshot();
     } finally { if (!this.isClosed) this.operation = "idle"; this.persist(); }
   }
   sendMessage(text: string, key?: string): { message_id: string } {
@@ -310,7 +357,7 @@ export class HarnessSession {
       return { message_id: old.message_id };
     }
     this.assertIdle();
-    if (this.state !== "ready") throw new BridgeError("authentication_required", "session is not ready");
+    if (this.state !== "ready") throw authenticationRequired(this.sessionId);
     const id = `msg_${randomUUID().replaceAll("-", "")}`;
     this.store.messageId = id;
     // Acceptance and slot are recorded before any ACP write or HTTP response.
@@ -343,11 +390,12 @@ export class HarnessSession {
       const response = await message.ticket.promise;
       message.response = response.result;
       message.stopReason = isRecord(response.result) ? response.result.stopReason : undefined;
-    } catch (error) { if (!(message.cancelRequested && this.state === "closed")) message.failure ??= errorInfo(error); }
+    } catch (error) { if (!(message.cancelRequested && this.state === "closed")) message.failure ??= errorInfo(normalizeError(error, this.sessionId)); }
     if (message.cancellation) {
       try { await message.cancellation; } catch (error) { message.failure ??= errorInfo(error); }
     }
     message.state = message.failure ? "failed" : message.cancelRequested || message.stopReason === "cancelled" ? "cancelled" : "completed";
+    if (message.failure?.code === "authentication_required") { this.authenticated = false; this.state = "authentication_required"; }
     message.finishedAt = iso();
     clearTimeout(message.timer); clearTimeout(message.inputTimer); message.questions.clear();
     this.journal("message_finished", { message_id: message.id, state: message.state, error: message.failure });
@@ -371,15 +419,41 @@ export class HarnessSession {
     // A finished message is not "stalled", and a message waiting on the user is waiting on input,
     // not on the model: neither should report a stall hint.
     if (done || message.state === "waiting_input") activity.stalled = false;
+    const progress = done ? null : this.progress(message);
     return { session_id: this.sessionId, message_id: id, state: message.state, terminal: done,
       submitted_at: message.submittedAt, finished_at: message.finishedAt,
       activity,
       unsupported: message.unsupported,
       questions: [...message.questions.values()].map(({ rpc_id, ...question }) => question),
+      ...(progress ? { progress } : {}),
       ...(message.failure ? { error: message.failure } : {}),
       ...(done ? { result: { text: message.text, reasoning: message.reasoning, tool_calls: [...message.tools.values()], stop_reason: message.stopReason ?? null, raw_result: message.response ?? null } } : {}) };
   }
+  private progress(message: Message): Record<string, unknown> {
+    const limit = this.config.buffers.previewTextBytes;
+    const bounded = (value: string): string => {
+      const safe = this.redactor.text(value);
+      const bytes = Buffer.from(safe);
+      if (bytes.length <= limit) return safe;
+      let end = limit;
+      while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
+      return `${bytes.subarray(0, end).toString("utf8")}…`;
+    };
+    const tools: unknown[] = [];
+    let size = 2;
+    for (const tool of [...message.tools.values()].slice(-50)) {
+      const safe = this.redactor.value(tool);
+      const encoded = JSON.stringify(safe);
+      if (size + Buffer.byteLength(encoded) > limit) break;
+      tools.push(safe); size += Buffer.byteLength(encoded) + 1;
+    }
+    return { text: bounded(message.text), reasoning: bounded(message.reasoning), tool_calls: tools };
+  }
   private onOutput(event: OutputEvent): void {
+    if (event.type === "auth" && this.authQuestionSink) {
+      const interaction = this.adapter.normalizeAuthInteraction(event.data);
+      if (interaction && this.authQuestionSink(this.authPrompt(interaction, async () => undefined))) return;
+    }
     // Only real model output advances the business progress clock. Metadata frames
     // (usage_update/config/session_info/plan, `_codebuddy.ai/*`) may update the observed phase as
     // evidence, but a periodic usage/idle heartbeat must never clear a stall.
@@ -400,6 +474,23 @@ export class HarnessSession {
   private onQuestion(question: Question): void {
     this.lastProgressAt = Date.now();
     this.observedPhase = "waiting_input";
+    if (this.authQuestionSink) {
+      const interaction = this.adapter.normalizeAuthQuestion(question);
+      const respond = (answer: string, optionId: string | null, content: Record<string, unknown> | null) => {
+        // Register any credential-shaped answer values as literal secrets for THIS session so the
+        // on-disk copy is masked by value while the wire bytes to the harness stay exact.
+        this.registerAuthSecrets(content);
+        return this.protocol.answer(question, answer, optionId, content);
+      };
+      const prompt: AuthPrompt = interaction
+        ? this.authPrompt(interaction, respond)
+        : { kind: question.kind, title: question.title, message: question.message, options: question.options,
+            schema: question.schema, raw: this.redactor.value(question.raw), respond };
+      if (this.authQuestionSink(prompt)) {
+        if (question.elicitation_id) this.authPrompts.set(question.elicitation_id, prompt);
+        return;
+      }
+    }
     const message = this.active;
     if (!message || message.cancelRequested) {
       void this.protocol.send({ jsonrpc: "2.0", id: question.rpc_id, error: { code: -32601, message: "no message awaiting input" } }).catch(error => this.onFault(error)); return;
@@ -411,6 +502,53 @@ export class HarnessSession {
       void this.cancelMessage(message.id, new BridgeError("input_timeout", "question was not answered before deadline")).catch(() => undefined);
     }, this.config.timeouts.inputTimeoutSeconds * 1000);
     this.persist();
+  }
+  /** Build the normalized auth prompt the coordinator enqueues for the client. */
+  private authPrompt(interaction: AuthInteraction, respond: AuthPrompt["respond"]): AuthPrompt {
+    return { kind: "information", title: interaction.title, message: interaction.message,
+      options: [], schema: interaction.schema, raw: this.redactor.value(interaction.raw), respond };
+  }
+  /** Treat string answer values (token/code/response/…) as ephemeral secrets for on-disk copies. */
+  private registerAuthSecrets(content: Record<string, unknown> | null): void {
+    if (!content) return;
+    const values: string[] = [];
+    for (const value of Object.values(content)) {
+      if (typeof value === "string") values.push(value);
+      else if (Array.isArray(value)) for (const item of value) if (typeof item === "string") values.push(item);
+    }
+    if (values.length) this.redactor.addSecrets(values);
+  }
+  /**
+   * Assemble stderr into lines and, only while an authentication is in flight, offer each line to
+   * the harness's strict login-URL hook. stderr is never parsed as JSON-RPC, and only the harness's
+   * own exact message is ever treated as an auth URL.
+   */
+  private onStderr(text: string): void {
+    if (!this.authQuestionSink || !text) return;
+    this.stderrBuffer += text;
+    if (this.stderrBuffer.length > 64 * 1024) this.stderrBuffer = this.stderrBuffer.slice(-8 * 1024);
+    let newline = this.stderrBuffer.indexOf("\n");
+    while (newline >= 0) {
+      const line = this.stderrBuffer.slice(0, newline).replace(/\r$/, "");
+      this.stderrBuffer = this.stderrBuffer.slice(newline + 1);
+      this.considerAuthStderr(line);
+      newline = this.stderrBuffer.indexOf("\n");
+    }
+  }
+  private considerAuthStderr(line: string): void {
+    if (!this.authQuestionSink || !line.trim()) return;
+    const interaction = this.adapter.normalizeAuthStderr(line);
+    if (!interaction) return;
+    this.authQuestionSink(this.authPrompt(interaction, async () => undefined));
+  }
+  /** Withdraw an auth question the harness has already completed out of band. */
+  private onQuestionStale(value: unknown): void {
+    const id = isRecord(value) && typeof value.elicitation_id === "string" ? value.elicitation_id : null;
+    if (!id) return;
+    const prompt = this.authPrompts.get(id);
+    if (!prompt) return;
+    this.authPrompts.delete(id);
+    prompt.cancel?.();
   }
   async answerQuestion(id: string, requestId: string, answer: string, optionId: string | null, content: Record<string, unknown> | null): Promise<Record<string, unknown>> {
     this.assertOpen();
@@ -445,6 +583,7 @@ export class HarnessSession {
   private async performCancel(message: Message): Promise<void> {
     try {
       await deadline((async () => {
+        if (!this.protocol.sessionId) throw new BridgeError("session_closed", "cannot cancel before a harness session exists");
         await this.protocol.notify("session/cancel", { sessionId: this.protocol.sessionId });
         await message.ticket?.promise.catch(() => undefined);
       })(), this.config.timeouts.turnCancelTimeoutSeconds, "cancel_timeout");
@@ -465,7 +604,7 @@ export class HarnessSession {
   close(failure?: Error): Promise<void> {
     if (this.closePromise) return this.closePromise;
     // Claim the state synchronously before any await; closed sessions cannot be revived.
-    this.state = failure ? "failed" : "closed"; this.operation = "closing";
+    this.state = failure ? "failed" : "closed"; this.operation = "closing"; this.authQuestionSink = null; this.authPrompts.clear();
     this.closePromise = Promise.resolve().then(() => this.finishClose(failure));
     return this.closePromise;
   }
@@ -476,7 +615,7 @@ export class HarnessSession {
     catch (error) { storageFailure = error; }
     if (message) {
       message.cancelRequested = true; message.failure ??= failure ? errorInfo(failure) : undefined;
-      await this.protocol.notify("session/cancel", { sessionId: this.protocol.sessionId }).catch(() => undefined);
+      if (this.protocol.sessionId) await this.protocol.notify("session/cancel", { sessionId: this.protocol.sessionId }).catch(() => undefined);
     }
     await this.transport.close(this.config.timeouts.terminateGraceSeconds + this.config.timeouts.remoteCleanupTimeoutSeconds * 2 + 3);
     this.protocol.failAll(failure ?? new BridgeError("session_closed", "session closed"));

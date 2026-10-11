@@ -83,8 +83,10 @@ export function describeFrame(frame: unknown): OutputEvent[] {
   if (["session/request_permission", "session/request_information", "elicitation/create"].includes(frame.method)) {
     return [{ type: "question", text: contentText(frame.params?.message ?? frame.params?.title ?? "Input required"), data: frame.params }];
   }
-  if (["_auth/status_update", "_codebuddy.ai/authUrl"].includes(frame.method)) {
-    return [{ type: "auth", text: JSON.stringify(frame.params), data: frame.params }];
+  if (frame.method === "_codebuddy.ai/authUrl") {
+    // Only the exact CodeBuddy device/browser-login notification is an auth interaction; other
+    // vendor/auth frames stay explicit unsupported traffic rather than being interpreted.
+    return [{ type: "auth", text: JSON.stringify(frame.params), data: { method: frame.method, params: frame.params } }];
   }
   if (["_codebuddy.ai/command", "_codebuddy.ai/checkpoint"].includes(frame.method)) {
     return [{ type: "session_options", text: JSON.stringify(frame.params), data: frame.params }];
@@ -102,6 +104,10 @@ export interface Question {
   message: string;
   options: Array<Record<string, unknown>>;
   schema: Record<string, unknown> | null;
+  /** URL-mode elicitation target, when the harness asked for a `mode: "url"` elicitation. */
+  url: string | null;
+  /** `elicitation/create`'s `elicitationId`, used to revoke a stale question on completion. */
+  elicitation_id: string | null;
   raw: Record<string, unknown>;
 }
 export class ProtocolAdapter extends EventEmitter {
@@ -185,18 +191,39 @@ export class ProtocolAdapter extends EventEmitter {
       return;
     }
     if (typeof frame.method !== "string") { this.unsupported(raw, frame); return; }
+    if (frame.method === "elicitation/complete") {
+      // A completion is a NOTIFICATION. A request carrying an id is unexpected and must be rejected
+      // (never silently treated as a notification, which would hang the harness).
+      if (typeof id === "number" || typeof id === "string") {
+        this.unsupported(raw, frame, "unsupported_request");
+        void this.send({ jsonrpc: "2.0", id, error: { code: -32601, message: "unsupported request", data: { raw: raw.toString("utf8") } } }).catch(error => this.emit("fault", error));
+        return;
+      }
+      // The harness signals a URL elicitation it raised earlier is done; any still-pending
+      // question for that id is stale and must be withdrawn, never answered.
+      const elicitationId = isRecord(frame.params) && typeof frame.params.elicitationId === "string" ? frame.params.elicitationId : null;
+      if (elicitationId) this.emit("question_stale", { elicitation_id: elicitationId });
+      return;
+    }
     if (typeof id === "number" || typeof id === "string") {
       const kind = frame.method === "session/request_permission" ? "permission" : frame.method === "session/request_information" ? "information" : frame.method === "elicitation/create" ? "elicitation" : null;
-      if (!kind || !isRecord(frame.params) || (kind === "elicitation" && frame.params.mode && frame.params.mode !== "form")) {
+      const mode = kind === "elicitation" && isRecord(frame.params) && typeof frame.params.mode === "string" ? frame.params.mode : "form";
+      if (!kind || !isRecord(frame.params) || (kind === "elicitation" && mode !== "form" && mode !== "url")) {
         this.unsupported(raw, frame, "unsupported_request");
         void this.send({ jsonrpc: "2.0", id, error: { code: -32601, message: "unsupported request", data: { raw: raw.toString("utf8") } } }).catch(error => this.emit("fault", error));
         return;
       }
       const params = frame.params;
+      const urlMode = kind === "elicitation" && mode === "url";
       this.emit("question", { request_id: String(id), rpc_id: id, kind,
         title: contentText(params.title ?? params.toolCall?.title ?? "Input required"), message: contentText(params.message ?? ""),
         options: Array.isArray(params.options) ? params.options.filter(isRecord) : [],
-        schema: isRecord(params.requestedSchema) ? params.requestedSchema : null, raw: frame } satisfies Question);
+        schema: isRecord(params.requestedSchema) ? params.requestedSchema : null,
+        // `url`/`elicitation_id` are populated ONLY for an explicit `mode: "url"` elicitation, so a
+        // form elicitation that happens to carry a url is never mistaken for a browser login.
+        url: urlMode && typeof params.url === "string" ? params.url : null,
+        elicitation_id: urlMode && typeof params.elicitationId === "string" ? params.elicitationId : null,
+        raw: frame } satisfies Question);
       return;
     }
     const events = describeFrame(frame);
@@ -224,10 +251,100 @@ export class ProtocolAdapter extends EventEmitter {
         const reject = question.options.find(option => String(option.kind).startsWith("reject"));
         result = reject ? { outcome: { outcome: "selected", optionId: reject.optionId } } : { outcome: { outcome: "cancelled" } };
       } else result = { outcome: { outcome: "cancelled" } };
+    } else if (question.kind === "elicitation" && question.elicitation_id !== null) {
+      // URL-mode elicitation carries no form data: only the action is echoed back (the harness is
+      // still waiting for the out-of-band browser round-trip to finish before login completes).
+      result = { action: answer === "accept" ? "accept" : answer === "reject" ? "decline" : "cancel" };
     } else {
       if (answer === "accept" && !content) throw new BridgeError("invalid_answer", "content must be an object");
+      if (answer === "accept" && question.schema) validateObjectSchema(question.schema, content!);
       result = { ...(question.kind === "elicitation" ? { action: answer === "accept" ? "accept" : answer === "reject" ? "decline" : "cancel" } : {}), content: content ?? {} };
     }
     return this.send({ jsonrpc: "2.0", id: question.rpc_id, result });
   }
+}
+
+/**
+ * Deterministic validator for the object schemas ACP uses for form questions.
+ *
+ * It validates the constraints the bridge understands (object/string/number/integer/boolean/array
+ * types, required, additionalProperties, enum/const, minLength/maxLength/pattern, numeric bounds,
+ * items/min/maxItems, and allOf/anyOf/oneOf). A schema using a constraint it cannot honor is
+ * rejected explicitly, so an invalid manual answer is never silently emitted to the harness.
+ */
+const UNSUPPORTED_SCHEMA_KEYS = ["$ref", "$defs", "definitions", "not", "if", "then", "else", "dependentSchemas", "patternProperties", "propertyNames", "unevaluatedProperties", "unevaluatedItems", "contains"];
+export function validateObjectSchema(schema: Record<string, unknown>, content: Record<string, unknown>): void {
+  checkSchema(schema, content, "content");
+}
+function checkSchema(schema: Record<string, unknown>, value: unknown, path: string): void {
+  if (!isRecord(schema)) throw new BridgeError("unsupported_request", "question schema must be an object");
+  for (const key of UNSUPPORTED_SCHEMA_KEYS) if (schema[key] !== undefined) throw new BridgeError("unsupported_request", `question schema uses unsupported keyword ${key}`);
+  if (Array.isArray(schema.allOf)) for (const sub of schema.allOf) checkSchema(sub as Record<string, unknown>, value, path);
+  if (Array.isArray(schema.anyOf) && !schema.anyOf.some(sub => matchesSchema(sub, value))) throw new BridgeError("invalid_answer", `${path} does not match any allowed shape`);
+  if (Array.isArray(schema.oneOf) && schema.oneOf.filter(sub => matchesSchema(sub, value)).length !== 1) throw new BridgeError("invalid_answer", `${path} does not match exactly one allowed shape`);
+  if (Array.isArray(schema.enum) && !schema.enum.some(candidate => Object.is(candidate, value))) throw new BridgeError("invalid_option", `${path} is not an offered value`);
+  if ("const" in schema && !Object.is(schema.const, value)) throw new BridgeError("invalid_option", `${path} is not the required value`);
+  const type = schema.type;
+  if (type !== undefined && typeof type !== "string") throw new BridgeError("unsupported_request", "question schema type must be a string");
+  const objectish = type === "object" || (type === undefined && ("properties" in schema || "required" in schema || "additionalProperties" in schema));
+  if (objectish) {
+    if (!isRecord(value)) throw new BridgeError("invalid_answer", `${path} must be an object`);
+    const properties = isRecord(schema.properties) ? schema.properties : {};
+    const required = Array.isArray(schema.required) ? schema.required.filter((name): name is string => typeof name === "string") : [];
+    for (const name of required) if (!(name in value)) throw new BridgeError("invalid_answer", `${name} is required`);
+    if (schema.additionalProperties === false) {
+      const unknown = Object.keys(value).filter(name => !(name in properties));
+      if (unknown.length) throw new BridgeError("invalid_answer", `unsupported answer field(s): ${unknown.join(", ")}`);
+    }
+    for (const [name, item] of Object.entries(value)) {
+      const rule = properties[name];
+      if (rule !== undefined) checkSchema(rule as Record<string, unknown>, item, name);
+    }
+    return;
+  }
+  if (type === undefined) return;
+  switch (type) {
+    case "array": {
+      if (!Array.isArray(value)) throw new BridgeError("invalid_answer", `${path} must be an array`);
+      if (typeof schema.minItems === "number" && value.length < schema.minItems) throw new BridgeError("invalid_answer", `${path} needs at least ${schema.minItems} items`);
+      if (typeof schema.maxItems === "number" && value.length > schema.maxItems) throw new BridgeError("invalid_answer", `${path} allows at most ${schema.maxItems} items`);
+      if (schema.items !== undefined) for (const item of value) checkSchema(schema.items as Record<string, unknown>, item, `${path}[]`);
+      return;
+    }
+    case "string": {
+      if (typeof value !== "string") throw new BridgeError("invalid_answer", `${path} must be a string`);
+      if (typeof schema.minLength === "number" && value.length < schema.minLength) throw new BridgeError("invalid_answer", `${path} is shorter than ${schema.minLength}`);
+      if (typeof schema.maxLength === "number" && value.length > schema.maxLength) throw new BridgeError("invalid_answer", `${path} is longer than ${schema.maxLength}`);
+      if (typeof schema.pattern === "string") {
+        let pattern: RegExp;
+        try { pattern = new RegExp(schema.pattern); }
+        catch { throw new BridgeError("unsupported_request", `${path} has an invalid pattern`); }
+        if (!pattern.test(value)) throw new BridgeError("invalid_answer", `${path} does not match the required pattern`);
+      }
+      return;
+    }
+    case "number":
+    case "integer": {
+      if (typeof value !== "number" || !Number.isFinite(value)) throw new BridgeError("invalid_answer", `${path} must be a number`);
+      if (type === "integer" && !Number.isInteger(value)) throw new BridgeError("invalid_answer", `${path} must be an integer`);
+      if (typeof schema.minimum === "number" && value < schema.minimum) throw new BridgeError("invalid_answer", `${path} is below the minimum`);
+      if (typeof schema.maximum === "number" && value > schema.maximum) throw new BridgeError("invalid_answer", `${path} is above the maximum`);
+      if (typeof schema.exclusiveMinimum === "number" && value <= schema.exclusiveMinimum) throw new BridgeError("invalid_answer", `${path} must be above the exclusive minimum`);
+      if (typeof schema.exclusiveMaximum === "number" && value >= schema.exclusiveMaximum) throw new BridgeError("invalid_answer", `${path} must be below the exclusive maximum`);
+      return;
+    }
+    case "boolean": {
+      if (typeof value !== "boolean") throw new BridgeError("invalid_answer", `${path} must be a boolean`);
+      return;
+    }
+    case "null": {
+      if (value !== null) throw new BridgeError("invalid_answer", `${path} must be null`);
+      return;
+    }
+    default: throw new BridgeError("unsupported_request", `unsupported question schema type: ${type}`);
+  }
+}
+function matchesSchema(schema: unknown, value: unknown): boolean {
+  if (!isRecord(schema)) return false;
+  try { checkSchema(schema, value, "value"); return true; } catch { return false; }
 }

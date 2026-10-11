@@ -7,8 +7,11 @@ import { describe, expect, it } from "vitest";
 
 import {
   AdapterError,
+  AgyAdapter,
   AuthStatusUnsupported,
   CodeBuddyAdapter,
+  CodexAdapter,
+  assertAuthenticateResult,
   getAdapter,
   normalizeAuthStatus,
   authMethods,
@@ -368,6 +371,50 @@ describe("adapters", () => {
     expect(() => normalizeAuthStatus({}, [])).toThrow(AuthStatusUnsupported);
     expect(authMethods({ result: { authMethods: [{ id: "a" }, "junk"] } })).toEqual([{ id: "a" }]);
     expect(authMethods({})).toEqual([]);
+  });
+
+  it("normalizes each harness's interactive-login step without inventing URLs", () => {
+    const url = "https://login.example.test/authorize?x=1";
+    const buddy = new CodeBuddyAdapter();
+    const notification = buddy.normalizeAuthInteraction({ method: "_codebuddy.ai/authUrl", params: { authUrl: url } });
+    expect(notification?.message).toBe(url);
+    expect(notification?.schema.properties).toEqual({ opened: { type: "boolean", enum: [true] } });
+    // An arbitrary string is never treated as a login URL.
+    expect(buddy.normalizeAuthInteraction({ method: "_codebuddy.ai/authUrl", params: { authUrl: "not a url" } })).toBeNull();
+    // Any other vendor/status frame carrying a url is NOT an auth step.
+    expect(buddy.normalizeAuthInteraction({ method: "_auth/status_update", params: { url } })).toBeNull();
+    expect(buddy.normalizeAuthInteraction({ params: { url } })).toBeNull();
+
+    const codex = new CodexAdapter();
+    const device = codex.normalizeAuthQuestion({ kind: "elicitation", title: "", message: "Sign in to ChatGPT and enter this code: ABCD-1234", url: "https://device.test/activate" });
+    // BOTH the machine code and the full verification URL are preserved.
+    expect(device?.message).toContain("ABCD-1234");
+    expect(device?.message).toContain("https://device.test/activate");
+    expect(device?.schema.properties).toEqual({ opened: { type: "boolean", enum: [true] } });
+    // A form elicitation (no url) or a non-elicitation question is not a browser step.
+    expect(codex.normalizeAuthQuestion({ kind: "elicitation", title: "", message: "Pick a value", url: null })).toBeNull();
+    expect(codex.normalizeAuthQuestion({ kind: "information", title: "", message: "x", url: "https://x.test" })).toBeNull();
+
+    const agy = new AgyAdapter();
+    const stderr = agy.normalizeAuthStderr("Open the following link to authenticate the ACP server: https://accounts.test/o/oauth2");
+    expect(stderr?.message).toBe("https://accounts.test/o/oauth2");
+    // Only the harness's own exact line is an auth URL; arbitrary stderr and links are not.
+    expect(agy.normalizeAuthStderr("Traceback: see https://accounts.test/o/oauth2")).toBeNull();
+    expect(agy.normalizeAuthStderr("Open the following link to authenticate the ACP server: not-a-url")).toBeNull();
+    expect(agy.normalizeAuthStderr("")).toBeNull();
+  });
+
+  it("refuses a nonstandard authenticate result instead of treating it as success", () => {
+    // Standard empty result (optionally with _meta) is authoritative.
+    expect(() => assertAuthenticateResult({ result: {} })).not.toThrow();
+    expect(() => assertAuthenticateResult({ result: { _meta: { x: 1 } } })).not.toThrow();
+    expect(() => assertAuthenticateResult({ result: { authenticated: true } })).not.toThrow();
+    // Known vendor flags are honoured.
+    expect(() => assertAuthenticateResult({ result: { success: true } })).not.toThrow();
+    expect(() => assertAuthenticateResult({ result: { success: false } })).toThrowError(/did not succeed/);
+    expect(() => assertAuthenticateResult({ result: { authenticated: false } })).toThrowError(/did not complete/);
+    // An unrecognised non-empty shape is explicitly unsupported, never a success.
+    expect(() => assertAuthenticateResult({ result: { nonstandard: true } })).toThrowError(/unsupported authenticate result/);
   });
 });
 

@@ -5,6 +5,7 @@
  * routing, and authentication status probing. A caller can never influence the command line
  * or environment beyond what the adapter and the config file decide.
  */
+import { BridgeError } from "./errors.js";
 import { publicAccount } from "./privacy.js";
 
 export type HarnessName = "codebuddy" | "codex" | "agy";
@@ -79,12 +80,46 @@ export interface AuthInfo {
   raw: Record<string, unknown>;
 }
 
+/**
+ * A normalized step of an interactive login: something the user must do (open a URL, enter a
+ * token/device code) before the harness `authenticate` call can complete. Never a success state.
+ */
+export interface AuthInteraction {
+  title: string;
+  message: string;
+  schema: Record<string, unknown>;
+  raw?: unknown;
+}
+
+/** Structural view of a reverse question, so adapters never import the protocol module. */
+export interface AuthQuestion {
+  kind: string;
+  title: string;
+  message: string;
+  /** URL-mode elicitation target (`elicitation/create` with `mode: "url"`). */
+  url?: string | null;
+}
+
+/** Browser actions only need an acknowledgement; the harness still waits for the real login. */
+const BROWSER_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  properties: { opened: { type: "boolean", enum: [true] } },
+  required: ["opened"],
+  additionalProperties: false,
+};
+
 export interface HarnessAdapter {
   readonly name: HarnessName;
   validate(config: AdapterConfig): void;
   buildArgv(config: AdapterConfig): string[];
   getAuthInfo(client: AdapterClient, initializeResponse: Record<string, unknown>): Promise<AuthInfo>;
   authenticate(client: AdapterClient, methodId: string): Promise<AuthInfo>;
+  /** Normalize a harness auth *notification* (an `auth` output event). */
+  normalizeAuthInteraction(data: unknown): AuthInteraction | null;
+  /** Normalize an incoming reverse question that belongs to the auth flow, or null. */
+  normalizeAuthQuestion(question: AuthQuestion): AuthInteraction | null;
+  /** Strict, per-harness stderr line hook that recognizes the harness's own login URL. */
+  normalizeAuthStderr(line: string): AuthInteraction | null;
   setModel(client: AdapterClient, modelId: string): Promise<Record<string, unknown>>;
   /** Harness-specific permission-mode routing; default is a no-op. */
   setMode(client: AdapterClient, config: AdapterConfig, sessionId: string): Promise<void>;
@@ -163,9 +198,16 @@ abstract class BaseAdapter implements HarnessAdapter {
   }
 
   async authenticate(client: AdapterClient, methodId: string): Promise<AuthInfo> {
-    await client.request("authenticate", { methodId });
+    const response = await client.request("authenticate", { methodId });
+    assertAuthenticateResult(response);
     return this.getAuthInfo(client, client.initializeResponse());
   }
+
+  normalizeAuthInteraction(_data: unknown): AuthInteraction | null { return null; }
+
+  normalizeAuthQuestion(_question: AuthQuestion): AuthInteraction | null { return null; }
+
+  normalizeAuthStderr(_line: string): AuthInteraction | null { return null; }
 
   async setModel(client: AdapterClient, modelId: string): Promise<Record<string, unknown>> {
     return client.request("session/set_model", { sessionId: client.sessionId(), modelId });
@@ -270,6 +312,18 @@ export class CodeBuddyAdapter extends BaseAdapter {
       raw: result,
     };
   }
+
+  override normalizeAuthInteraction(data: unknown): AuthInteraction | null {
+    // Only CodeBuddy's proprietary `_codebuddy.ai/authUrl` notification is an auth step; a generic
+    // status frame that merely carries a `url` is left as explicit unsupported traffic.
+    if (!isRecord(data) || data.method !== "_codebuddy.ai/authUrl") return null;
+    const params = isRecord(data.params) ? data.params : null;
+    const value = params?.authUrl ?? params?.authURL ?? params?.auth_url ?? params?.url;
+    if (typeof value !== "string" || !/^https?:\/\/\S+$/i.test(value)) return null;
+    // The whole usable URL is the message; confirming it is only an acknowledgement, never proof of
+    // login.
+    return { title: "Complete CodeBuddy authentication", message: value, schema: BROWSER_SCHEMA, raw: data };
+  }
 }
 
 export class CodexAdapter extends BaseAdapter {
@@ -321,6 +375,21 @@ export class CodexAdapter extends BaseAdapter {
       value: mode[config.permissionMode],
     });
   }
+
+  /**
+   * The ChatGPT device-code flow raises a URL-mode `elicitation/create` whose message carries the
+   * machine code the user types in the browser and whose `url` is the verification page. The
+   * normalized question must contain BOTH the full verification URL and the machine code; accepting
+   * only acknowledges, the login still has to complete.
+   */
+  override normalizeAuthQuestion(question: AuthQuestion): AuthInteraction | null {
+    if (question.kind !== "elicitation") return null;
+    const url = typeof question.url === "string" ? question.url.trim() : "";
+    if (!/^https?:\/\/\S+$/i.test(url)) return null;
+    const text = question.message.trim();
+    const message = text && text.includes(url) ? text : [text, url].filter(Boolean).join("\n");
+    return { title: "Complete Codex authentication", message, schema: BROWSER_SCHEMA, raw: question };
+  }
 }
 
 export class AgyAdapter extends BaseAdapter {
@@ -339,6 +408,20 @@ export class AgyAdapter extends BaseAdapter {
     // No mode id configured for this permission mode: leave the harness default alone.
     if (!config.acpModeId) return;
     await client.request("session/set_mode", { sessionId, modeId: config.acpModeId });
+  }
+
+  /**
+   * Agy 1.3.0's OAuth loopback login prints its authorization URL to stderr (never stdout, which
+   * is the JSON-RPC channel) and blocks the `authenticate` call until the browser round-trip
+   * completes. Only that exact, harness-owned line is an auth URL; arbitrary stderr — including
+   * tracebacks with unrelated links — is not.
+   */
+  override normalizeAuthStderr(line: string): AuthInteraction | null {
+    const match = /^Open the following link to authenticate the ACP server:\s*(https?:\/\/\S+)\s*$/.exec(line.trim());
+    if (!match) return null;
+    const url = match[1]!;
+    if (!/^https?:\/\/\S+$/i.test(url)) return null;
+    return { title: "Complete Agy authentication", message: url, schema: BROWSER_SCHEMA, raw: { line: line.trim() } };
   }
 }
 
@@ -391,6 +474,27 @@ function assertReturnedOption(response: Record<string, unknown>, configId: strin
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * The ACP `AuthenticateResponse` is an empty object (optionally with `_meta`); the harness session
+ * opening right after is the real proof of login. Known vendor shapes that carry an explicit login
+ * flag are honoured; an unknown non-empty shape is refused rather than treated as success, so a
+ * nonstandard `{success:false}` (or any unrecognised payload) is never accepted.
+ */
+export function assertAuthenticateResult(response: Record<string, unknown>): void {
+  const result = isRecord(response.result) ? response.result : null;
+  if (!result) throw new BridgeError("unsupported_response", "authenticate returned no result object", { raw: response });
+  if (typeof result.authenticated === "boolean") {
+    if (!result.authenticated) throw new BridgeError("authentication_failed", "harness reported the login did not complete", { result });
+    return;
+  }
+  if (typeof result.success === "boolean") {
+    if (!result.success) throw new BridgeError("authentication_failed", "harness reported the login did not succeed", { result });
+    return;
+  }
+  const unknown = Object.keys(result).filter(key => key !== "_meta");
+  if (unknown.length) throw new BridgeError("unsupported_response", `unsupported authenticate result fields: ${unknown.join(", ")}`, { result });
 }
 
 function rpcCode(error: unknown): number | null {

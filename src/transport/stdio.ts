@@ -44,7 +44,14 @@ export class StdioTransport extends EventEmitter {
     child.stdout.on("end", () => this.onStdoutClosed());
     child.stdout.on("close", () => this.onStdoutClosed());
     child.stderr.on("data", (chunk: Buffer) => {
-      try { this.receiveStderr(chunk); } catch (error) { this.emit("fault", new BridgeError("storage_error", String(error))); }
+      try {
+        // Transient, per-chunk stderr text for a harness that announces an interactive login
+        // URL on stderr (the ACP stdout channel cannot carry it). Known secrets are stripped
+        // in-place; this event is never persisted (the redacted `raw.jsonl` remains authoritative)
+        // and is consumed only by the strict, per-harness auth-URL matcher.
+        this.emit("stderr", this.store.redactor.text(chunk.toString("utf8")));
+        this.receiveStderr(chunk);
+      } catch (error) { this.emit("fault", new BridgeError("storage_error", String(error))); }
     });
     child.on("error", error => this.emit("fault", new BridgeError("transport_error", error.message)));
     child.once("close", (code, signal) => {

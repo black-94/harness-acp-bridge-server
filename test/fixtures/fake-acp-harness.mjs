@@ -38,8 +38,17 @@ const EMIT_GARBAGE = FLAGS.has("--emit-garbage");
 /**
  * `--auth-required` makes the harness advertise login and report an unauthenticated status.
  * `--auth-hang` implies it (a hanging login only makes sense on a login-gated harness).
+ * `--auth-methods` advertises a richer, behaviour-per-method set used by the flow tests.
  */
-const AUTH_REQUIRED = FLAGS.has("--auth-required") || AUTH_HANG;
+const AUTH_METHODS = FLAGS.has("--auth-methods");
+/**
+ * `--external-auth` models a login completed outside the bridge: the status probe starts reporting
+ * authenticated after a short delay while the harness session is still unopened.
+ */
+const EXTERNAL_AUTH = FLAGS.has("--external-auth");
+/** `--status-auth-32000` makes the status probe report an explicit ACP -32000 until logged in. */
+const STATUS_32000 = FLAGS.has("--status-auth-32000");
+const AUTH_REQUIRED = FLAGS.has("--auth-required") || AUTH_HANG || AUTH_METHODS || EXTERNAL_AUTH || STATUS_32000;
 
 // When set, long-lived child in the harness's process group, with its pid recorded so a test
 // can assert the whole group is reaped when the daemon dies.
@@ -62,6 +71,10 @@ let pendingPrompt = null;
 let pendingPermission = null;
 let pendingInfo = null;
 let pendingElicitation = null;
+/** In-flight `authenticate` for the `--auth-methods` flow, with its reverse interaction. */
+let pendingAuth = null;
+let pendingAuthInfo = null;
+let authRequestId = 9300;
 let authenticated = !AUTH_REQUIRED;
 let optionsHang = FLAGS.has("--options-hang");
 /**
@@ -69,6 +82,17 @@ let optionsHang = FLAGS.has("--options-hang");
  * bridge delivered the ORIGINAL credential bytes on the wire (before any on-disk redaction).
  */
 const PROMPT_FILE = process.env.FAKE_HARNESS_PROMPT_FILE;
+/** Records every `authenticate` method id, proving the bridge did not write credentials. */
+const AUTH_FILE = process.env.FAKE_HARNESS_AUTH_FILE;
+/** Records the exact auth answer content the harness received (the original wire bytes). */
+const ANSWER_FILE = process.env.FAKE_HARNESS_ANSWER_FILE;
+
+// An externally completed login: the status probe starts reporting authenticated shortly after
+// startup, while the harness session is still unopened.
+if (EXTERNAL_AUTH) {
+  const timer = setTimeout(() => { authenticated = true; }, 200);
+  timer.unref?.();
+}
 
 const AVAILABLE_MODELS = [
   { modelId: "fake-model", name: "Fake Model" },
@@ -335,20 +359,107 @@ function startPrompt(id, text) {
   finishPrompt(id, "end_turn");
 }
 
+// --- interactive authentication (`--auth-methods`) ---------------------------
+// Each advertised method drives a different real login shape so the bridge's normalization
+// (method selection, URL elicitation, token input, stderr URL) can be exercised deterministically.
+
+function finishAuth(success) {
+  if (!pendingAuth) return;
+  authenticated = success;
+  const id = pendingAuth.id;
+  pendingAuth = null; pendingAuthInfo = null;
+  reply(id, { authenticated: success });
+}
+function sendAuthInfo(stage) {
+  const requestId = authRequestId++;
+  let schema, title, message;
+  if (stage === 1 || stage === 4) { schema = { type: "object", properties: { account: { type: "string" } }, required: ["account"], additionalProperties: false }; title = "Choose account"; message = "Which account?"; }
+  else if (stage === 2) { schema = { type: "object", properties: { token: { type: "string", minLength: 8 } }, required: ["token"], additionalProperties: false }; title = "Enter token"; message = "Paste the token"; }
+  else {
+    // Credential-shaped fields proving values named code/response/answer are never persisted, while
+    // the exact bytes still reach the harness.
+    schema = { type: "object", properties: {
+      code: { type: "string", minLength: 4 },
+      response: { type: "string" },
+      answer: { type: "string" },
+      retries: { type: "integer", minimum: 0, maximum: 5 },
+    }, required: ["code"], additionalProperties: false };
+    title = "Credential codes"; message = "Provide the credential fields";
+  }
+  pendingAuthInfo = { requestId, stage };
+  send({ jsonrpc: "2.0", id: requestId, method: "session/request_information",
+    params: { sessionId, title, message, requestedSchema: schema } });
+}
+function startAuth(methodId) {
+  if (methodId === "token") { sendAuthInfo(1); return; }
+  if (methodId === "approve") {
+    // A permission question must be answerable with an offered option and NO content, followed by
+    // an information question (the permission-then-information auth loop).
+    const requestId = authRequestId++;
+    if (pendingAuth) pendingAuth.permRequestId = requestId;
+    send({ jsonrpc: "2.0", id: requestId, method: "session/request_permission",
+      params: { sessionId, message: "Allow the login helper?", options: [
+        { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+        { optionId: "deny_once", name: "Deny", kind: "reject_once" } ] } });
+    return;
+  }
+  if (methodId === "codes") { sendAuthInfo(3); return; }
+  if (methodId === "device") {
+    const requestId = authRequestId++;
+    if (pendingAuth) pendingAuth.elicitRequestId = requestId;
+    send({
+      jsonrpc: "2.0",
+      id: requestId,
+      method: "elicitation/create",
+      params: { sessionId, mode: "url", elicitationId: "device-1", url: "https://example.test/device",
+        message: "Sign in to ChatGPT and enter this code: ABCD-1234" },
+    });
+    return;
+  }
+  if (methodId === "browser") {
+    // The Agy-style loopback login: URL on stderr, then the login completes later. The delay
+    // proves that acknowledging the browser step is not itself success.
+    process.stderr.write("Open the following link to authenticate the ACP server: https://example.test/oauth\n");
+    const timer = setTimeout(() => finishAuth(true), 600);
+    timer.unref?.();
+    return;
+  }
+  // `api-key` (and any unknown method) succeed immediately.
+  finishAuth(true);
+}
+
 function handle(message) {
   if (message.method === "initialize") {
     if (FLAGS.has("--handshake-hang")) return;
+    const authMethods = !AUTH_REQUIRED ? [] : AUTH_METHODS
+      ? [
+          { id: "api-key", name: "API key", description: "Use an API key" },
+          { id: "token", name: "Token" },
+          { id: "approve", name: "Approve" },
+          { id: "device", name: "Device code" },
+          { id: "browser", name: "Browser" },
+          { id: "codes", name: "Credential codes" },
+          { id: "client-code", name: "Client code", type: "client" },
+        ]
+      : [{ id: "api-key", name: "API key" }];
     reply(message.id, {
       protocolVersion: 1,
-      authMethods: AUTH_REQUIRED ? [{ id: "api-key", name: "API key" }] : [],
+      authMethods,
       models: { currentModelId: model, availableModels: AVAILABLE_MODELS },
     });
     return;
   }
   if (message.method === "authenticate") {
+    if (AUTH_FILE) appendFileSync(AUTH_FILE, `${message.params?.methodId ?? "?"}\n`);
     if (AUTH_HANG) return; // never reply: the bridge's authentication timeout must fire
-    authenticated = true;
-    reply(message.id, { authenticated: true });
+    if (FLAGS.has("--auth-result-false")) { reply(message.id, { success: false }); return; }
+    if (!AUTH_METHODS) {
+      authenticated = true;
+      reply(message.id, { authenticated: true });
+      return;
+    }
+    pendingAuth = { id: message.id, methodId: message.params?.methodId, elicitRequestId: null, permRequestId: null };
+    startAuth(message.params?.methodId);
     return;
   }
   // Auth-status probes: the base adapter uses `authentication/status`, CodeBuddy uses its
@@ -356,6 +467,11 @@ function handle(message) {
   if (message.method === "authentication/status") {
     if (!AUTH_REQUIRED) {
       send({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "unsupported" } });
+      return;
+    }
+    if (STATUS_32000 && !authenticated) {
+      // A genuine auth-required at session setup, expressed as ACP -32000 rather than a status.
+      send({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: "authentication required", data: { code: "authentication_required" } } });
       return;
     }
     reply(message.id, { authenticated, kind: authenticated ? "api-key" : "none" });
@@ -396,6 +512,11 @@ function handle(message) {
     return;
   }
   if (message.method === "session/set_model") {
+    // A synchronous adapter RPC that reports an explicit auth-required via ACP -32000.
+    if (FLAGS.has("--set-model-auth-32000")) {
+      send({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: "authentication required", data: { code: "authentication_required" } } });
+      return;
+    }
     model = message.params?.modelId ?? model;
     reply(message.id, { modelId: model });
     return;
@@ -414,6 +535,36 @@ function handle(message) {
     pendingPermission = null;
     pendingInfo = null;
     pendingElicitation = null;
+    pendingAuth = null;
+    pendingAuthInfo = null;
+    return;
+  }
+
+  // Response to an auth token/account/credential information request (`--auth-methods`).
+  if (pendingAuthInfo && message.id === pendingAuthInfo.requestId) {
+    const stage = pendingAuthInfo.stage;
+    pendingAuthInfo = null;
+    if (stage === 3) {
+      // The harness's own proof it received the ORIGINAL answer bytes on the wire.
+      if (ANSWER_FILE) appendFileSync(ANSWER_FILE, `${JSON.stringify(message.result?.content ?? {})}\n`);
+      finishAuth(true);
+      return;
+    }
+    if (stage === 1) sendAuthInfo(2);
+    else finishAuth(true);
+    return;  }
+
+  // Response to the auth permission question: an offered option id, then the info step.
+  if (pendingAuth && pendingAuth.permRequestId === message.id) {
+    const optionId = message.result?.outcome?.optionId ?? null;
+    if (optionId === "allow_once") sendAuthInfo(4);
+    else finishAuth(false);
+    return;
+  }
+
+  // Response to the device-code URL elicitation: accepting continues the login, declining fails it.
+  if (pendingAuth && pendingAuth.elicitRequestId === message.id) {
+    finishAuth(message.result?.action === "accept");
     return;
   }
 
