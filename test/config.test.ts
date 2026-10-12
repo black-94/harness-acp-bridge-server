@@ -35,7 +35,6 @@ const DECLARED = `schema_version: 2
 default_harness: codebuddy
 harnesses:
   codebuddy:
-    command: codebuddy
     models:
       - id: m-declared
         name: Declared
@@ -46,12 +45,10 @@ harnesses:
       - id: m-unknown
         name: Unknown
   codex:
-    command: codex-acp
     models:
       - id: c1
         name: Codex One
   agy:
-    command: agy_acp_server
     models:
       - id: a1
         name: Agy One
@@ -94,7 +91,6 @@ describe("model thinking_levels declaration", () => {
         `schema_version: 2
 harnesses:
   codebuddy:
-    command: codebuddy
     models:
       - id: m
         thinking_levels: high

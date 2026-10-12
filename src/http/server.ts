@@ -8,7 +8,7 @@ const statusOf = (code: string): number => {
   if (code.startsWith("invalid_")) return 400;
   if (["invalid_json", "invalid_param", "invalid_cursor", "unknown_param", "launch_internal", "invalid_option", "invalid_answer"].includes(code)) return 400;
   if (code.endsWith("not_found")) return 404;
-  if (["busy", "session_closed", "session_exists", "idempotency_conflict", "no_pending_question"].includes(code)) return 409;
+  if (["busy", "session_closed", "session_exists", "template_exists", "idempotency_conflict", "no_pending_question"].includes(code)) return 409;
   if (code === "authentication_required") return 403;
   if (code.startsWith("unsupported")) return 501;
   if (code.endsWith("timeout")) return 504;

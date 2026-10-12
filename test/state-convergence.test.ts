@@ -30,7 +30,7 @@ async function setup(settings: Record<string, unknown> = {}) {
     timeouts: { startup_timeout_seconds: 3, request_timeout_seconds: 1, turn_timeout_seconds: 5, turn_cancel_timeout_seconds: 0.3, terminate_grace_seconds: 0.05, remote_cleanup_timeout_seconds: 0.05, authentication_timeout_seconds: 0.5 },
     authentication: { rate_limit: { enabled: false } },
     default_harness: "codebuddy",
-    harnesses: { codebuddy: { command: process.execPath, args: [fixture], models: [{ id: "fake-model", thinking_levels: ["low", "high"] }] } },
+    harnesses: { codebuddy: { models: [{ id: "fake-model", thinking_levels: ["low", "high"] }] } },
     ...settings,
   }));
   const config = loadConfig(path);
@@ -38,9 +38,10 @@ async function setup(settings: Record<string, unknown> = {}) {
   const address = await server.start();
   cleanup.push(async () => { await server.stop(); rmSync(directory, { recursive: true, force: true }); });
   const request = async (method: string, params: Record<string, unknown> = {}) => {
-    const response = await fetch(`http://127.0.0.1:${address.port}/api/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(params) });
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(method === "create_session" ? { template: "fixture", ...params } : params) });
     return { status: response.status, ...(await response.json() as any) };
   };
+  expect((await request("register_template", { template: { name: "fixture", harness: "codebuddy", command: process.execPath, args: [fixture] } })).ok).toBe(true);
   const create = async () => (await request("create_session", { cwd: directory, model_id: "fake-model" })).data.session_id as string;
   const waitTerminal = async (session: string, message: string) => {
     const end = Date.now() + 6000;

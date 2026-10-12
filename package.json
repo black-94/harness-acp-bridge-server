@@ -35,6 +35,7 @@
   "files": [
     "dist",
     "config.example.yaml",
+    "templates",
     "README.md",
     "LICENSE"
   ],

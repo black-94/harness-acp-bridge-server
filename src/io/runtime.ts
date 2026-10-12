@@ -194,6 +194,7 @@ export function dockerExecArgv(spec: LaunchSpec): string[] {
     "-i",
     "--workdir",
     spec.cwd,
+    ...Object.entries(spec.harnessEnv).flatMap(([key, value]) => ["--env", `${key}=${value}`]),
     spec.dockerContainerName,
     ...spec.argv,
   ];
@@ -219,7 +220,7 @@ export function dockerExecArgv(spec: LaunchSpec): string[] {
  */
 export function remoteCommand(spec: LaunchSpec, program: string[] = dockerExecArgv(spec)): string {
   const programParts: string[] = [];
-  const remoteEnv = spec.harnessEnv ?? {};
+  const remoteEnv = spec.dockerContainerName ? {} : spec.harnessEnv;
   if (Object.keys(remoteEnv).length > 0) {
     programParts.push("env", ...Object.entries(remoteEnv).map(([key, value]) => `${key}=${value}`));
   }
@@ -308,12 +309,12 @@ export function buildTransportTarget(spec: LaunchSpec): TransportTarget {
     return {
       argv: [spec.sshCommand, "--", spec.sshHost as string, remoteCommand(spec, program)],
       cwd: null,
-      env,
+      env: {},
     };
   }
   // A Docker harness enters the container, so the local supervisor must not chdir to a
   // container path.
-  return { argv: program, cwd: spec.dockerContainerName ? null : spec.cwd, env };
+  return { argv: program, cwd: spec.dockerContainerName ? null : spec.cwd, env: spec.dockerContainerName ? {} : env };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -1,0 +1,23 @@
+{
+  "name": "codebuddy-docker",
+  "description": "CodeBuddy ACP in Docker; replace the image and host login directory before registration",
+  "harness": "codebuddy",
+  "target": "local",
+  "remote_host": null,
+  "runtime": "docker",
+  "command": "/usr/local/bin/codebuddy",
+  "args": [],
+  "env": {},
+  "permission_mode": "auto",
+  "cwd": "/workspace",
+  "docker_image": "your-codebuddy-image:latest",
+  "container_policy": "keep",
+  "login_dirs": [
+    { "source": "/absolute/host/codebuddy-login", "target": "/root/.codebuddy", "read_only": false }
+  ],
+  "mounts": [
+    { "source": "/absolute/host/project", "target": "/workspace", "read_only": false }
+  ],
+  "ports": [],
+  "host_network": false
+}

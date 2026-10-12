@@ -577,6 +577,16 @@ describe("runtime argument builders", () => {
     expect(sshDocker.argv[3]).toContain("docker exec -i --workdir /inside cid codebuddy");
     expect(dockerExecArgv(spec())).toEqual(["codebuddy", "--acp"]);
   });
+  it("isolates harness environment from Docker/SSH control programs", () => {
+    const env = { PATH: "/container/bin", API_KEY: "secret" };
+    const dockerSpec = spec({ dockerContainerName: "cid", harnessEnv: env });
+    expect(buildTransportTarget(dockerSpec).env).toEqual({});
+    expect(dockerExecArgv(dockerSpec)).toContain("PATH=/container/bin");
+    const sshSpec = spec({ launchMode: "ssh", sshHost: "h1", harnessEnv: env });
+    expect(buildTransportTarget(sshSpec).env).toEqual({});
+    expect(remoteCommand(sshSpec)).toContain("env PATH=/container/bin");
+    expect(remoteCommand({ ...dockerSpec, launchMode: "ssh", sshHost: "h1" })).not.toContain("env PATH=/container/bin docker");
+  });
 });
 
 // --- create_session validation ----------------------------------------------

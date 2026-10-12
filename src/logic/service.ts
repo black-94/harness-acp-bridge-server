@@ -9,8 +9,9 @@ import { authenticationRequired, BridgeError, isRecord } from "./errors.js";
 import { isValidSessionId, newSessionId, QUEUE_FILE, RAW_FILE, readJsonFileSafe, RESULTS_DIR, SESSION_FILE, sessionDirectory, writeJsonAtomicSync } from "../io/persistence.js";
 import { Redactor, collectSecrets } from "../redact/redact.js";
 import { HarnessSession } from "./session.js";
+import { TemplateRegistry, templateDefaults } from "./templates.js";
 
-export const METHODS = ["ping", "search_harness", "create_session", "close_session", "authenticate", "auth_status", "set_session_options", "send_message", "cancel_message", "message_status", "answer_question"] as const;
+export const METHODS = ["ping", "search_harness", "register_template", "delete_template", "search_template", "create_session", "close_session", "authenticate", "auth_status", "set_session_options", "send_message", "cancel_message", "message_status", "answer_question"] as const;
 /** Bumped when the public HTTP contract changes incompatibly (interactive auth, no live_output). */
 export const PROTOCOL_VERSION = 3;
 export interface RequestContext { signal?: AbortSignal }
@@ -24,12 +25,14 @@ export class HarnessService {
   readonly sessions = new Map<string, HarnessSession>();
   private readonly auth: AuthCoordinator;
   private readonly redactor: Redactor;
+  private readonly templates: TemplateRegistry;
   private reaper: ReturnType<typeof setInterval> | null = null;
   private stopping = false;
   private readonly startedAt = Date.now();
   private lockToken: string | null = null;
   constructor(readonly config: BridgeConfig) {
-    this.redactor = new Redactor(collectSecrets(process.env, config.harnesses));
+    this.redactor = new Redactor(collectSecrets(process.env));
+    this.templates = new TemplateRegistry(config.paths.stateDir);
     this.auth = new AuthCoordinator({ ledger: new AuthLedger({ path: config.authentication.ledgerPath, rateLimit: config.authentication.rateLimit }),
       maxConcurrentTargets: config.authentication.maxConcurrentTargets, timeoutSeconds: config.timeouts.authenticationTimeoutSeconds,
       inputTimeoutSeconds: config.timeouts.inputTimeoutSeconds,
@@ -112,13 +115,43 @@ export class HarnessService {
       case "search_harness":
         assertAllowedKeys(params, ["harness"]);
         return { harnesses: harnessInfo(this.config, string(params, "harness", true)) };
+      case "register_template": {
+        assertAllowedKeys(params, ["template"]);
+        return { template: this.templates.register(params.template) };
+      }
+      case "delete_template": {
+        assertAllowedKeys(params, ["name"]);
+        const name = string(params, "name")!;
+        this.templates.delete(name);
+        return { name, deleted: true };
+      }
+      case "search_template":
+        assertAllowedKeys(params, ["query", "harness", "name"]);
+        return { templates: this.templates.search(string(params, "query", true), string(params, "harness", true), string(params, "name", true)) };
       case "create_session": {
-        const options = normalizeCreateParams(params);
+        const templateName = string(params, "template", true);
+        const template = templateName ? this.templates.get(templateName) : null;
+        const { template: ignored, ...requested } = params;
+        if (template && params.harness !== undefined && params.harness !== null && params.harness !== template.harness) {
+          throw new BridgeError("invalid_param", "harness must match the selected template");
+        }
+        const defaults = template ? templateDefaults(template) : {};
+        // Changing a remote template to local must not carry its inherited SSH host along.
+        // An explicitly supplied remote_host is still validated rather than silently discarded.
+        if (template && params.target === "local") defaults.remote_host = null;
+        // Reused containers fix their own image/mounts/ports/network; do not inject new-container defaults.
+        if (requested.docker_id !== undefined && requested.docker_id !== null) {
+          for (const key of ["docker_image", "mounts", "ports", "host_network"]) delete defaults[key];
+        }
+        const options = normalizeCreateParams({ ...defaults, ...requested,
+          ...(template ? { harness: template.harness, runtime: params.runtime ?? template.runtime,
+            target: params.target ?? template.target } : {}) });
+        if (template && options.runtime !== template.runtime) throw new BridgeError("invalid_param", "runtime must match the selected template");
         if ([...this.sessions.values()].filter(session => !session.isClosed).length >= this.config.sessions.maxConcurrency) throw new BridgeError("session_limit", "maximum live session count reached");
         const id = options.sessionId ?? newSessionId();
         if (!isValidSessionId(id)) throw new BridgeError("invalid_param", "invalid session_id");
         if (this.sessions.has(id) || existsSync(sessionDirectory(this.config.paths.sessionDir, id))) throw new BridgeError("session_exists", "session_id already exists");
-        const session = new HarnessSession(this.config, options, id, this.redactor);
+        const session = new HarnessSession(this.config, options, id, undefined, template);
         this.sessions.set(id, session);
         await session.initialize();
         // `create_session.authenticate` no longer exists (it bypassed the flow). An unauthenticated

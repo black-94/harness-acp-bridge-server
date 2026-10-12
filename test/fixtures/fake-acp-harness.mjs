@@ -431,6 +431,10 @@ function startAuth(methodId) {
 function handle(message) {
   if (message.method === "initialize") {
     if (FLAGS.has("--handshake-hang")) return;
+    if (FLAGS.has("--initialize-auth-required")) {
+      send({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: "login required before initialize" } });
+      return;
+    }
     const authMethods = !AUTH_REQUIRED ? [] : AUTH_METHODS
       ? [
           { id: "api-key", name: "API key", description: "Use an API key" },
@@ -444,6 +448,7 @@ function handle(message) {
       : [{ id: "api-key", name: "API key" }];
     reply(message.id, {
       protocolVersion: 1,
+      ...(!FLAGS.has("--no-agent-info") ? { agentInfo: { name: process.argv.find(arg => arg.startsWith("--fake-agent="))?.split("=")[1] ?? "codebuddy", version: "test" } } : {}),
       // A real loadSession-capable harness advertises the capability the bridge restores against.
       agentCapabilities: { loadSession: true },
       authMethods,

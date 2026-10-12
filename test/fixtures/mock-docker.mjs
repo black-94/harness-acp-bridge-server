@@ -53,6 +53,8 @@ if (command === "start") {
 if (command === "exec") {
   // Strip the flags the bridge uses, then execute the remainder locally.
   const rest = argv.slice(1);
+  const env = { ...process.env };
+  let cwd;
   while (rest.length > 0) {
     const head = rest[0];
     if (head === "-i" || head === "-t" || head === "--interactive") {
@@ -61,14 +63,21 @@ if (command === "exec") {
     }
     if (head === "--workdir") {
       rest.shift();
+      cwd = rest.shift();
+      continue;
+    }
+    if (head === "--env") {
       rest.shift();
+      const value = rest.shift();
+      const equals = value.indexOf("=");
+      env[value.slice(0, equals)] = value.slice(equals + 1);
       continue;
     }
     break;
   }
   rest.shift(); // container name
   const [program, ...programArgs] = rest;
-  const child = spawn(program, programArgs, { stdio: "inherit" });
+  const child = spawn(program, programArgs, { stdio: "inherit", env, cwd });
   child.on("exit", (code, signal) => process.exit(signal ? 1 : (code ?? 0)));
   child.on("error", (error) => {
     process.stderr.write(`${error.message}\n`);

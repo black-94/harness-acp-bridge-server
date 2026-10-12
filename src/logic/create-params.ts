@@ -4,7 +4,7 @@
  * A caller can choose *where* and *how* a harness runs (local/remote, direct/docker, and
  * explicit Docker options) but can never inject launch internals: the command, its
  * arguments, the environment, the SSH program, or any directory the bridge writes to. Those
- * come from the configuration file only.
+ * come from registered templates or server defaults; SSH/Docker plumbing stays in YAML.
  */
 import { isBuiltinHarness, type ContainerPolicy, type PermissionMode, type Runtime } from "../adapter/adapters.js";
 import type { DockerMountSpec, DockerPortSpec } from "../io/runtime.js";
@@ -19,7 +19,7 @@ export class ParamError extends Error {
   }
 }
 
-/** Keys a caller must never supply; they are owned by the configuration file. */
+/** Keys a create_session caller must never supply; they are owned by templates/server settings. */
 export const LAUNCH_INTERNALS: ReadonlySet<string> = new Set([
   "command",
   "args",

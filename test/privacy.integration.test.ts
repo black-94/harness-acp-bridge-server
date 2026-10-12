@@ -82,16 +82,17 @@ async function setup(harnessEnv: Record<string, string>, extra: Record<string, u
     server: { host: "127.0.0.1", port: 0 }, sessions: { max_concurrency: 4, reap_interval_seconds: 0.05 },
     timeouts: { startup_timeout_seconds: 3, request_timeout_seconds: 1, turn_timeout_seconds: 5, turn_cancel_timeout_seconds: 0.3, terminate_grace_seconds: 0.05, remote_cleanup_timeout_seconds: 0.05, authentication_timeout_seconds: 0.5 },
     authentication: { rate_limit: { enabled: false } }, default_harness: "codebuddy",
-    harnesses: { codebuddy: { command: process.execPath, args: [fixture], env: harnessEnv, models: [{ id: "fake-model", thinking_levels: ["low", "high"] }] } }, ...extra }));
+    harnesses: { codebuddy: { models: [{ id: "fake-model", thinking_levels: ["low", "high"] }] } }, ...extra }));
   const config = loadConfig(path);
   const server = new HarnessHttpServer(config);
   const address = await server.start();
   cleanup.push(async () => { await server.stop(); rmSync(directory, { recursive: true, force: true }); });
   const base = `http://127.0.0.1:${address.port}`;
   const request = async (method: string, params: Record<string, unknown> = {}) => {
-    const response = await fetch(`${base}/api/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(params) });
+    const response = await fetch(`${base}/api/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(method === "create_session" ? { template: "fixture", ...params } : params) });
     return { status: response.status, ...(await response.json() as any) };
   };
+  expect((await request("register_template", { template: { name: "fixture", harness: "codebuddy", command: process.execPath, args: [fixture], env: harnessEnv } })).ok).toBe(true);
   const create = async () => {
     const response = await request("create_session", { cwd: directory, model_id: "fake-model" });
     expect(response.ok, JSON.stringify(response)).toBe(true); return response.data.session_id as string;
@@ -148,7 +149,7 @@ describe("privacy: end-to-end redaction with a real server and fake harness", ()
     expect(disk).toContain("suffix 😀");
 
     // (4) Sanitize-before-write: every atomic `.tmp` payload (serialized, pre-rename) was already clean.
-    const temporaryWrites = writes.filter(entry => entry.path.endsWith(".tmp"));
+    const temporaryWrites = writes.filter(entry => entry.path.endsWith(".tmp") && !entry.path.includes("templates.json."));
     expect(temporaryWrites.length).toBeGreaterThan(0);
     for (const entry of temporaryWrites) for (const sentinel of SENTINELS) expect(entry.data, `temp write leaked ${sentinel}`).not.toContain(sentinel);
 

@@ -13,6 +13,8 @@ import { readJsonFileSafe, SessionStore } from "../io/persistence.js";
 import { Redactor, collectSecrets } from "../redact/redact.js";
 import { StdioTransport } from "../transport/stdio.js";
 import { inspectContainer, newRemotePidFile, type LaunchSpec } from "../io/runtime.js";
+import { resolveLocalCommand } from "../io/commands.js";
+import { assertHarnessIdentity, HARNESS_COMMANDS, type LaunchTemplate } from "./templates.js";
 
 export type MessageState = "running" | "waiting_input" | "cancelling" | "completed" | "failed" | "cancelled";
 interface Message {
@@ -77,15 +79,19 @@ export class HarnessSession {
   private lastTransportEventAt: number | null = null;
   private lastProgressAt: number | null = null;
   private observedPhase: string | null = null;
-  constructor(readonly config: BridgeConfig, readonly params: CreateSessionParams, sessionId: string, redactor?: Redactor) {
+  constructor(readonly config: BridgeConfig, readonly params: CreateSessionParams, sessionId: string, redactor?: Redactor, private readonly template: LaunchTemplate | null = null) {
     const harness = resolveHarness(config, params.harness);
     this.sessionId = sessionId;
     this.adapter = getAdapter(harness.name);
     this.modelId = params.modelId; this.thinkingLevel = params.thinkingLevel; this.permissionMode = params.permissionMode;
     this.assertThinkingLevel(params.modelId, params.thinkingLevel);
+    const env = template?.env ?? {};
+    let command = template?.command || HARNESS_COMMANDS[harness.name];
+    if (!command) throw new BridgeError("invalid_harness_command", "no built-in executable for selected harness");
+    if (params.target === "local" && params.runtime === "direct") command = resolveLocalCommand(command, env, params.cwd);
     this.adapterConfig = {
       harness: harness.name, cwd: params.cwd, modelId: params.modelId,
-      command: harness.command, args: harness.args, env: harness.env,
+      command, args: template?.args ?? [], env,
       launchMode: params.target === "remote" ? "ssh" : "local", runtime: params.runtime,
       permissionMode: params.permissionMode, acpModeId: config.launch.agyModeIds[params.permissionMode] ?? null,
       sshHost: params.remoteHost, dockerImage: params.dockerImage, reuseContainer: Boolean(params.dockerId),
@@ -94,7 +100,7 @@ export class HarnessSession {
     this.spec = {
       launchMode: this.adapterConfig.launchMode, sshHost: params.remoteHost,
       sshCommand: config.launch.sshCommand, dockerCommand: config.launch.dockerCommand,
-      cwd: params.cwd, argv: this.adapter.buildArgv(this.adapterConfig), harnessEnv: harness.env,
+      cwd: params.cwd, argv: this.adapter.buildArgv(this.adapterConfig), harnessEnv: env,
       dockerImage: params.dockerImage, dockerContainerName: params.runtime === "docker" ? params.dockerId ?? `harness-acp-${randomUUID().replaceAll("-", "")}` : null,
       dockerId: params.dockerId, dockerMounts: params.dockerMounts, dockerPorts: params.dockerPorts,
       dockerHostNetwork: params.dockerHostNetwork, containerPolicy: params.containerPolicy,
@@ -103,7 +109,7 @@ export class HarnessSession {
       terminateGraceSeconds: config.timeouts.terminateGraceSeconds,
       remoteCleanupTimeoutSeconds: config.timeouts.remoteCleanupTimeoutSeconds,
     };
-    this.redactor = redactor ?? new Redactor(collectSecrets(process.env, config.harnesses));
+    this.redactor = redactor ?? new Redactor(collectSecrets(process.env, { launch: { env } }));
     this.store = new SessionStore(config.paths.sessionDir, sessionId, this.redactor);
     this.metadataPath = join(tmpdir(), `harness-acp-${randomUUID()}.json`);
     this.transport = new StdioTransport(this.store, config.buffers.maxReadBytes);
@@ -145,6 +151,7 @@ export class HarnessSession {
     }
   }
   async initialize(): Promise<void> {
+    let identityValidated = false;
     try {
       if (this.spec.reuseContainer) await inspectContainer(this.spec, this.config.timeouts.startupTimeoutSeconds * 1000);
       this.transport.start({ ...this.spec, metadataPath: this.metadataPath, daemonPid: process.pid });
@@ -154,6 +161,8 @@ export class HarnessSession {
         clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false,
           auth: { terminal: false }, elicitation: { form: {}, url: {} } },
         clientInfo: { name: "harness-acp-bridge", version: CLIENT_VERSION } });
+      assertHarnessIdentity(this.adapter.name, this.protocol.initializeResponse);
+      identityValidated = true;
       const methods = authMethods(this.protocol.initializeResponse);
       if (methods.length) {
         const info = await this.refreshAuthInfo();
@@ -164,7 +173,10 @@ export class HarnessSession {
       this.journal(this.state === "ready" ? "session_ready" : "authentication_required", this.snapshot());
       this.persist();
     } catch (error) {
-      const normalized = normalizeError(error, this.sessionId);
+      let normalized = normalizeError(error, this.sessionId);
+      if (!identityValidated && normalized instanceof BridgeError && normalized.code === "authentication_required") {
+        normalized = new BridgeError("invalid_harness_command", "cannot validate harness identity: initialize requires authentication");
+      }
       // A genuine auth-required during setup keeps the initialized harness alive for `authenticate`;
       // an unrecoverable handshake/transport failure closes it so it is never advertised as usable.
       if (normalized instanceof BridgeError && normalized.code === "authentication_required") {
@@ -173,6 +185,10 @@ export class HarnessSession {
         return;
       }
       await this.close(normalized instanceof Error ? normalized : new Error(String(normalized)));
+      const launchError = this.launchInfo?.launch_error;
+      if (isRecord(launchError) && typeof launchError.code === "string" && typeof launchError.message === "string") {
+        throw new BridgeError(launchError.code, launchError.message);
+      }
       throw normalized;
     }
   }
@@ -199,7 +215,7 @@ export class HarnessSession {
   options(): Record<string, unknown> { return { model_id: this.modelId, thinking_level: this.thinkingLevel, permission_mode: this.permissionMode }; }
   snapshot(): Record<string, unknown> {
     this.launchInfo = readJsonFileSafe(this.metadataPath) ?? this.launchInfo;
-    return { version: 2, session_id: this.sessionId, harness: this.adapter.name, state: this.state,
+    return { version: 2, session_id: this.sessionId, harness: this.adapter.name, template: this.template?.name ?? null, state: this.state,
       operation: this.operation, created_at: this.createdAt, updated_at: iso(), last_activity_at: new Date(this.lastActivity).toISOString(),
       activity: this.activity(),
       cwd: this.params.cwd, target: this.params.target, runtime: this.params.runtime,

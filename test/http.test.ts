@@ -17,16 +17,23 @@ async function setup(settings: Record<string, unknown> = {}, flags: string[] = [
     server: { host: "127.0.0.1", port: 0 }, sessions: { max_concurrency: 4, reap_interval_seconds: 0.05 },
     timeouts: { startup_timeout_seconds: 3, request_timeout_seconds: 1, turn_timeout_seconds: 5, turn_cancel_timeout_seconds: 0.3, terminate_grace_seconds: 0.05, remote_cleanup_timeout_seconds: 0.05, authentication_timeout_seconds: 0.5 },
     authentication: { rate_limit: { enabled: false } },
-    default_harness: harness, harnesses: { [harness]: { command: process.execPath, args: [fixture, ...flags], models: [{ id: "fake-model", thinking_levels: ["low", "high"] }, { id: "fake-model-2", thinking_levels: ["low"] }] } }, ...settings }));
+    default_harness: harness, harnesses: { [harness]: { models: [{ id: "fake-model", thinking_levels: ["low", "high"] }, { id: "fake-model-2", thinking_levels: ["low"] }] } }, ...settings }));
   const config = loadConfig(path);
   const server = new HarnessHttpServer(config);
   const address = await server.start();
   cleanup.push(async () => { await server.stop(); rmSync(directory, { recursive: true, force: true }); });
   const base = `http://127.0.0.1:${address.port}`;
   const request = async (method: string, params: Record<string, unknown> = {}) => {
-    const response = await fetch(`${base}/api/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(params) });
+    const response = await fetch(`${base}/api/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(method === "create_session" ? { template: params.runtime === "docker" ? "fixture-docker" : "fixture", ...params } : params) });
     return { status: response.status, ...(await response.json() as any) };
   };
+  for (const runtime of ["direct", "docker"]) {
+    await server.service.dispatch("register_template", { template: {
+      name: runtime === "docker" ? "fixture-docker" : "fixture", harness, runtime,
+      command: process.execPath, args: [fixture, `--fake-agent=${harness}`, ...flags],
+      ...(runtime === "docker" ? { docker_image: "mock/image:1" } : {}),
+    } });
+  }
   const create = async () => {
     const response = await request("create_session", { cwd: directory, model_id: "fake-model" });
     expect(response.ok, JSON.stringify(response)).toBe(true); return response.data.session_id as string;

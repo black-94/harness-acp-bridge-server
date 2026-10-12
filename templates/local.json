@@ -1,0 +1,13 @@
+{
+  "name": "codebuddy-local",
+  "description": "Run locally using the installed CodeBuddy ACP command and its existing login; supply cwd when creating a session",
+  "harness": "codebuddy",
+  "target": "local",
+  "remote_host": null,
+  "runtime": "direct",
+  "command": null,
+  "args": [],
+  "env": {},
+  "permission_mode": "auto",
+  "cwd": null
+}

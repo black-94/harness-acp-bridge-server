@@ -79,10 +79,6 @@ export interface ModelConfig {
 
 export interface HarnessConfig {
   name: string;
-  /** Explicitly configured command, or the `launch.<harness>_command` fallback. */
-  command: string;
-  args: string[];
-  env: Record<string, string>;
   models: ModelConfig[];
   description: string | null;
 }
@@ -131,8 +127,6 @@ export interface BridgeConfig {
   launch: {
     sshCommand: string;
     dockerCommand: string;
-    /** Configured command per built-in harness name, used when a harness omits `command`. */
-    harnessCommands: Record<string, string>;
     /** Agy ACP mode ids per permission mode (`agy_<mode>_mode_id`). */
     agyModeIds: Record<string, string | null>;
   };
@@ -169,15 +163,8 @@ const modelSchema = z
   })
   .strict();
 
-const envName = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
 const harnessSchema = z
   .object({
-    // Optional: falls back to `launch.<harness>_command` for the built-in harness names.
-    command: z.string().min(1).nullable().default(null),
-    // Keys must be valid environment variable names; values are arbitrary strings.
-    args: z.array(z.string()).default([]),
-    env: z.record(z.string().regex(envName), z.string()).default({}),
     models: z.array(modelSchema).default([]),
     description: z.string().nullable().default(null),
   })
@@ -237,9 +224,6 @@ const fileSchema = z
       .object({
         ssh_command: z.string().min(1).default("ssh"),
         docker_command: z.string().min(1).default("docker"),
-        codebuddy_command: z.string().min(1).default("codebuddy"),
-        codex_command: z.string().min(1).default("codex-acp"),
-        agy_command: z.string().min(1).default("agy_acp_server"),
         agy_read_mode_id: z.string().min(1).nullable().default(null),
         agy_edit_mode_id: z.string().min(1).nullable().default(null),
         agy_auto_mode_id: z.string().min(1).nullable().default(null),
@@ -336,18 +320,7 @@ function resolveConfig(file: FileConfig, configPath: string | null): BridgeConfi
 
   const harnesses: Record<string, HarnessConfig> = {};
   const modelIds = new Set<string>();
-  const launchCommands: Record<string, string> = {
-    codebuddy: file.launch.codebuddy_command,
-    codex: file.launch.codex_command,
-    agy: file.launch.agy_command,
-  };
   for (const [name, harness] of Object.entries(file.harnesses)) {
-    const command = harness.command ?? launchCommands[name] ?? null;
-    if (command === null) {
-      throw new ConfigError(
-        `harnesses.${name}.command is required for a harness without a launch.*_command default`,
-      );
-    }
     const models: ModelConfig[] = harness.models.map((model) => {
       if (modelIds.has(`${name}:${model.id}`)) {
         throw new ConfigError(`duplicate model id ${JSON.stringify(model.id)} in harness ${name}`);
@@ -361,9 +334,6 @@ function resolveConfig(file: FileConfig, configPath: string | null): BridgeConfi
     });
     harnesses[name] = {
       name,
-      command,
-      args: [...harness.args],
-      env: { ...harness.env },
       models,
       description: harness.description,
     };
@@ -410,7 +380,6 @@ function resolveConfig(file: FileConfig, configPath: string | null): BridgeConfi
     launch: {
       sshCommand: file.launch.ssh_command,
       dockerCommand: file.launch.docker_command,
-      harnessCommands: launchCommands,
       agyModeIds: {
         read: file.launch.agy_read_mode_id,
         edit: file.launch.agy_edit_mode_id,
@@ -512,7 +481,6 @@ export interface HarnessModelInfo {
 export interface HarnessInfo {
   name: string;
   description: string | null;
-  command: string;
   /**
    * Permission modes the built-in adapter can actually route with this configuration. Empty
    * for a configured entry without a built-in adapter.
@@ -527,7 +495,6 @@ export function describeHarness(config: BridgeConfig, name: string): HarnessInfo
   return {
     name: harness.name,
     description: harness.description,
-    command: harness.command,
     permission_modes: supportedPermissionModes(harness.name, config.launch.agyModeIds),
     models: harness.models.map((model) => ({
       id: model.id,

@@ -28,6 +28,8 @@ import process from "node:process";
 
 import { isEntryPoint } from "../io/entry.js";
 import { writeAtomicFileSync } from "../io/persistence.js";
+import { resolveTargetCommand } from "../io/commands.js";
+import { BridgeError } from "../logic/errors.js";
 import {
   SUPERVISOR_SPEC_ENV,
   buildTransportTarget,
@@ -233,6 +235,7 @@ async function run(spec: SupervisorSpec): Promise<void> {
     if (context.terminatedSignal) {
       exitCode = exitCodeFor(context, 0);
     } else {
+      spec.argv[0] = await resolveTargetCommand(spec, context.prepareAbort.signal);
       const target = buildTransportTarget(spec);
       const child = spawn(target.argv[0] as string, target.argv.slice(1), {
         cwd: target.cwd ?? undefined,
@@ -246,6 +249,10 @@ async function run(spec: SupervisorSpec): Promise<void> {
       exitCode = await waitForHarness(child);
     }
   } catch (error) {
+    if (error instanceof BridgeError) {
+      try { writeAtomicFileSync(spec.metadataPath, JSON.stringify({ launch_error: { code: error.code, message: error.message } })); }
+      catch { /* Error metadata is advisory. */ }
+    }
     process.stderr.write(`harness supervisor: ${error instanceof Error ? error.message : String(error)}\n`);
     exitCode = 1;
   } finally {

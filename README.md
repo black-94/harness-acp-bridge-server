@@ -108,7 +108,10 @@ return 409; unsupported operations/responses return 501; deadlines return 504.
 | --- | --- |
 | `ping` | `{}`. Server liveness, protocol version, PID, live-session count, config fingerprint. |
 | `search_harness` | `harness?`. Lists configured harnesses, models, declared thinking levels, and permission modes. Starts no harness and performs no discovery probes. |
-| `create_session` | Required `cwd`, `model_id`; optional `harness`, `thinking_level`, `permission_mode`, and launch fields below. On success returns the session snapshot, including `session_id`, state, effective options, and launch info. If the harness is not logged in, the session is created and kept alive but the call returns `authentication_required` (403) with `detail.next_action` (use that `session_id` with `authenticate`; do not re-create it). |
+| `register_template` | `template` object. Validates and durably registers a launch template; duplicate names return `template_exists` (409). Starts no harness. |
+| `delete_template` | `name`. Deletes a registered template; unknown names return `template_not_found` (404). Existing sessions are unaffected. |
+| `search_template` | Optional `name` (exact), `query` (case-insensitive substring of name/harness/description), `harness` (exact). Returns `{templates: [...]}` sorted by name; starts no harness. |
+| `create_session` | Required `model_id` and `cwd` (unless provided by a template); optional `template` name, `harness`, `thinking_level`, `permission_mode`, and launch fields below. On success returns the session snapshot, including `session_id`, state, effective options, and launch info. If the harness is not logged in, the session is created and kept alive but the call returns `authentication_required` (403) with `detail.next_action` (use that `session_id` with `authenticate`; do not re-create it). |
 | `close_session` | `session_id`. Stops the harness and closes the session; repeated close is safe. Allowed even for a session that never authenticated. |
 | `authenticate` | `session_id` only. Starts (or reuses, or, after a finished flow, restarts) an interactive login and returns the flow snapshot immediately. It never takes a `method_id`. |
 | `auth_status` | `session_id`. While a flow exists, returns that flow's read-only snapshot — including a terminal `cancelled`/`failed` one with `questions: []` (no re-probe, no blocking); once the session is gone it returns `session_closed`. With no flow, probes the harness; an unavailable probe returns `unsupported_response` with original response/details, and an unknown status is never guessed as logged out. |
@@ -119,8 +122,10 @@ return 409; unsupported operations/responses return 501; deadlines return 504.
 | `answer_question` | `session_id`, `request_id`, optional `answer` (`accept`, `reject`, `timeout`, `cancel`, default `accept`), `option_id`, `content`, and optional `message_id`. With a `message_id` the answer routes to that message's reverse question; without one it answers the session's authentication flow. Permissions require an offered option; information/form answers require an object validated against the question's schema. |
 
 Authentication here is the child harness's login, not HTTP client authentication.
-Commands, argv, environment, SSH/Docker programs, state paths, and buffer settings are
-administrator-owned configuration, not request parameters.
+Commands, argv and harness environment are administrator-owned **templates**, never direct
+`create_session` parameters. SSH/Docker programs, state paths and buffer settings remain YAML
+configuration. Template APIs are administrative: this server has no HTTP authorization layer;
+keep it on a trusted/loopback interface and do not expose registration to untrusted callers.
 
 `create_session` launch fields:
 
@@ -134,6 +139,76 @@ administrator-owned configuration, not request parameters.
 Permission modes are `read`, `edit`, `auto`, `yolo`. Adapters determine whether a particular
 harness supports changing a mode live. Declared `thinking_levels: []` means none;
 omission means unknown, checked against live ACP options when available.
+
+## Launch templates and command validation
+
+See [`templates/local.json`](templates/local.json) for a local/direct example and
+[`templates/docker.json`](templates/docker.json) for a Docker example. The local example uses
+PATH and the harness's existing local login; `env` can configure its `HOME` or supported credential
+variables without embedding a separate bridge login. Supply `cwd` when creating a local-example
+session. Replace the Docker example's image and host paths before registering it:
+
+```sh
+jq '{template: .}' templates/docker.json | curl -sS http://127.0.0.1:8787/api/register_template \
+  -H 'Content-Type: application/json' --data-binary @-
+curl -sS http://127.0.0.1:8787/api/create_session -H 'Content-Type: application/json' \
+  -d '{"template":"codebuddy-docker","model_id":"claude-sonnet-4"}'
+```
+
+Fields: `name` (unique identifier), `harness` (`codebuddy`/`codex`/`agy`), optional `description`,
+`target` (`local` by default), `remote_host`, `runtime` (`direct` by default), `command`, `args`,
+`env`, `permission_mode` (`auto` by default), `cwd` (absolute path), and Docker
+`docker_image`, `container_policy` (`remove`/`keep`), `login_dirs`, `mounts`, `ports`,
+`host_network`. Both `login_dirs` and `mounts` are bind-mount lists with
+`{source, target, read_only?}`; login mounts persist the harness's own credentials, not bridge
+credentials. Source/target paths must be absolute, targets cannot repeat, and host networking
+cannot coexist with published ports. Unknown fields, malformed data, Docker fields on a direct
+template, managed adapter flags and detaching arguments are rejected as `invalid_template` (400).
+Registration validates structure and argv without starting Docker or executing commands.
+`target: remote` requires a nonempty `remote_host` (SSH hostname/alias, optionally `user@host`);
+a local template must omit it or use null. Target and runtime are independent, allowing
+local/direct, remote/direct, local/Docker and remote/Docker templates. For example:
+
+```json
+{"name":"codebuddy-remote","harness":"codebuddy","target":"remote",
+ "remote_host":"user@build-host","runtime":"direct","command":null,"cwd":"/workspace"}
+```
+
+Template permission modes are enum-validated at registration. Agy's non-auto permission modes
+also require the corresponding YAML mode IDs and are checked against the server configuration
+when a session is created.
+
+Templates persist atomically in `<state_dir>/templates.json` (0600), survive server restarts, and
+are returned by search in full. Environment values are launch configuration and are stored
+unchanged in this private registry; do not put secrets in templates unless necessary. Session
+journals still redact template environment secrets. To change a template, delete then register
+it again. An accepted session keeps its own template snapshot.
+
+`create_session` overlays ordinary launch parameters on template defaults; `harness` and
+`runtime` must match the template. `target`, `remote_host` and `permission_mode` inherit the
+template's values unless overridden. Switching a remote template to `target: local` clears its
+inherited host; explicitly supplying a host for local execution is still rejected. Switching a
+local template to remote requires a request-supplied `remote_host`. `docker_id` reuse skips the template's image/mount/network/port
+defaults because the existing container fixes them. YAML `harnesses` still declares models and
+the default harness. `harnesses.*.command/args/env` and
+`launch.codebuddy_command/codex_command/agy_command` are removed and rejected; migrate launch
+settings into templates. Without a template, the built-in command is used with no extra args/env.
+
+A nonempty template `command` takes priority (absolute path or executable name). Empty/null
+uses `codebuddy`, `codex-acp`, or `agy_acp_server` on PATH. Local/direct checks the server's PATH;
+SSH/direct checks the remote PATH; Docker checks PATH **inside the container** on its target.
+Missing/non-executable commands return `command_not_found` (404); an invalid explicit command
+never falls back to another executable. Container preparation is needed before its check.
+
+Before opening an ACP session or probing authentication, `create_session` performs ACP
+`initialize` and verifies `agentInfo.name` matches the selected harness (case-insensitive exact
+known names: CodeBuddy `codebuddy`/`codebuddy-code`, Codex `codex`/`codex-acp`, Agy
+`agy`/`agy-acp-server`/`agy_acp_server`/`antigravity`). Missing/mismatched identity returns
+`invalid_harness_command` (400), never sends `session/new`/`session/load`, and closes the process
+and cleans up resources according to container policy. Failed creation may retain a bridge
+failure journal, but no usable ACP session. A non-ACP program or a hung handshake is rejected by
+the normal protocol/startup validation and deadline. Identity is protocol compatibility validation,
+not a cryptographic guarantee against a malicious command spoofing its own name.
 
 ## Authentication flow
 

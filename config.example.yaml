@@ -41,9 +41,6 @@ buffers:
 launch:
   ssh_command: ssh
   docker_command: docker
-  codebuddy_command: codebuddy
-  codex_command: codex-acp
-  agy_command: agy_acp_server
   agy_read_mode_id: null
   agy_edit_mode_id: null
   agy_auto_mode_id: null
@@ -62,9 +59,6 @@ authentication:
 default_harness: codebuddy
 harnesses:
   codebuddy:
-    command: codebuddy
-    args: []
-    env: {}
     models:
       - id: claude-sonnet-4
         name: Claude Sonnet 4
@@ -73,16 +67,10 @@ harnesses:
         name: GPT-5
         # Omitted thinking_levels means unknown, not unsupported.
   codex:
-    command: codex-acp
-    args: []
-    env: {}
     models:
       - id: gpt-5-codex
         name: GPT-5 Codex
   agy:
-    command: agy_acp_server
-    args: []
-    env: {}
     models:
       - id: gemini-2.5-pro
         name: Gemini 2.5 Pro
