@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { BridgeError, authenticationRequired, errorInfo, normalizeError } from "../src/errors";
+import { BridgeError, authenticationRequired, errorInfo, normalizeError } from "../src/logic/errors";
 
 describe("authentication error normalization", () => {
   it("recognizes ACP -32000 and explicit vendor codes, never arbitrary text", () => {

@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import { supportedPermissionModes, type PermissionMode } from "./adapters.js";
+import { supportedPermissionModes, type PermissionMode } from "../adapter/adapters.js";
 
 export const CONFIG_ENV = "HARNESS_ACP_BRIDGE_CONFIG";
 export const SCHEMA_VERSION = 2;

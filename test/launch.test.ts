@@ -18,8 +18,8 @@ import {
   supportedPermissionModes,
   type AdapterClient,
   type AdapterConfig,
-} from "../src/adapters";
-import { isIpAddress, normalizeCreateParams, ParamError } from "../src/create-params";
+} from "../src/adapter/adapters";
+import { isIpAddress, normalizeCreateParams, ParamError } from "../src/logic/create-params";
 import {
   buildTransportTarget,
   containerAction,
@@ -34,7 +34,7 @@ import {
   shellJoin,
   shellQuote,
   type LaunchSpec,
-} from "../src/runtime";
+} from "../src/io/runtime";
 
 function adapterConfig(overrides: Partial<AdapterConfig> = {}): AdapterConfig {
   return {

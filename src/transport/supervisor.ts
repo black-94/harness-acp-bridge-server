@@ -28,7 +28,7 @@ import { realpathSync } from "node:fs";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { writeAtomicFileSync } from "./persistence.js";
+import { writeAtomicFileSync } from "../io/persistence.js";
 import {
   SUPERVISOR_SPEC_ENV,
   buildTransportTarget,
@@ -40,7 +40,7 @@ import {
   type CleanupAction,
   type SupervisorMetadata,
   type SupervisorSpec,
-} from "./runtime.js";
+} from "../io/runtime.js";
 
 /** How often the watchdog confirms the daemon is still alive. */
 const WATCHDOG_INTERVAL_MS = 1000;

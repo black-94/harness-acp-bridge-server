@@ -6,7 +6,7 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
 
-import { ProtocolAdapter, describeFrame, validateObjectSchema, type Question } from "../src/adapter/protocol";
+import { ProtocolAdapter, describeFrame, validateObjectSchema, type Question } from "../src/acp/protocol";
 
 class FakeTransport extends EventEmitter {
   readonly written: Record<string, unknown>[] = [];

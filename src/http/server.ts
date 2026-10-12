@@ -1,8 +1,8 @@
 /** HTTP boundary: route/JSON validation, response envelopes, and client disconnects. */
 import { createServer, type Server, type ServerResponse, type IncomingMessage } from "node:http";
-import { BridgeError, errorInfo, isRecord } from "../errors.js";
+import { BridgeError, errorInfo, isRecord } from "../logic/errors.js";
 import { METHODS, HarnessService } from "../logic/service.js";
-import { type BridgeConfig } from "../config.js";
+import { type BridgeConfig } from "../logic/config.js";
 
 const statusOf = (code: string): number => {
   if (code.startsWith("invalid_")) return 400;

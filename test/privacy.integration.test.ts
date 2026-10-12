@@ -4,11 +4,11 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { stringify } from "yaml";
-import { loadConfig } from "../src/config";
+import { loadConfig } from "../src/logic/config";
 import { HarnessHttpServer } from "../dist/http/server.js";
-import { SessionStore } from "../src/persistence";
+import { SessionStore } from "../src/io/persistence";
 import { StdioTransport } from "../src/transport/stdio";
-import { Redactor } from "../src/redact";
+import { Redactor } from "../src/redact/redact";
 
 const fixture = fileURLToPath(new URL("./fixtures/fake-acp-harness.mjs", import.meta.url));
 

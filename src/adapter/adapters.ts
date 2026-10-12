@@ -5,8 +5,8 @@
  * routing, and authentication status probing. A caller can never influence the command line
  * or environment beyond what the adapter and the config file decide.
  */
-import { BridgeError } from "./errors.js";
-import { publicAccount } from "./privacy.js";
+import { BridgeError } from "../logic/errors.js";
+import { publicAccount } from "../redact/privacy.js";
 
 export type HarnessName = "codebuddy" | "codex" | "agy";
 export type LaunchMode = "local" | "ssh";

@@ -3,16 +3,16 @@ import { createHash, randomUUID } from "node:crypto";
 import { unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CLIENT_VERSION, ProtocolAdapter, type OutputEvent, type Question, type RequestTicket } from "../adapter/protocol.js";
-import { AuthStatusUnsupported, getAdapter, authMethods, type AdapterConfig, type AuthInfo, type AuthInteraction } from "../adapters.js";
-import { authTargetKey, type AuthCandidate, type AuthPrompt } from "../auth.js";
-import { declaredThinkingLevels, resolveHarness, type BridgeConfig } from "../config.js";
-import { type CreateSessionParams } from "../create-params.js";
-import { authenticationRequired, BridgeError, deadline, errorInfo, isRecord, normalizeError } from "../errors.js";
-import { readJsonFileSafe, SessionStore } from "../persistence.js";
-import { Redactor, collectSecrets } from "../redact.js";
+import { CLIENT_VERSION, ProtocolAdapter, type OutputEvent, type Question, type RequestTicket } from "../acp/protocol.js";
+import { AuthStatusUnsupported, getAdapter, authMethods, type AdapterConfig, type AuthInfo, type AuthInteraction } from "../adapter/adapters.js";
+import { authTargetKey, type AuthCandidate, type AuthPrompt } from "./auth.js";
+import { declaredThinkingLevels, resolveHarness, type BridgeConfig } from "./config.js";
+import { type CreateSessionParams } from "./create-params.js";
+import { authenticationRequired, BridgeError, deadline, errorInfo, isRecord, normalizeError } from "./errors.js";
+import { readJsonFileSafe, SessionStore } from "../io/persistence.js";
+import { Redactor, collectSecrets } from "../redact/redact.js";
 import { StdioTransport } from "../transport/stdio.js";
-import { inspectContainer, newRemotePidFile, type LaunchSpec } from "../runtime.js";
+import { inspectContainer, newRemotePidFile, type LaunchSpec } from "../io/runtime.js";
 
 export type MessageState = "running" | "waiting_input" | "cancelling" | "completed" | "failed" | "cancelled";
 interface Message {

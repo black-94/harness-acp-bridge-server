@@ -18,7 +18,7 @@ import {
   type AuthSession,
   authTargetKey,
   type RateLimitSettings,
-} from "../src/auth";
+} from "../src/logic/auth";
 
 const cleanups: Array<() => void> = [];
 

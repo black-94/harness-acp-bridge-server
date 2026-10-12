@@ -13,7 +13,7 @@ npm run build
 HARNESS_ACP_BRIDGE_CONFIG=./config.example.yaml npm start
 ```
 
-The service entrypoint is `dist/main.js`; the package has no CLI executables or MCP
+The service entrypoint is `dist/hacp.js`; the package has no CLI executables or MCP
 server. Configuration is resolved from `HARNESS_ACP_BRIDGE_CONFIG`, the XDG/default
 config location, then built-in defaults. All settings use schema version 2; unknown
 fields and older schema versions are rejected. Defaults bind `127.0.0.1:8787`.
@@ -21,13 +21,26 @@ fields and older schema versions are rejected. Defaults bind `127.0.0.1:8787`.
 For embedding, import `HarnessHttpServer` and `loadConfig` from the package, call
 `start()`, and call `stop()` to close the listener and its sessions.
 
-## Five layers
+## Layers and layout
+
+`src/` keeps only the exported `index.ts` and the `hacp.ts` command entrypoint; the
+implementation lives in focused directories:
+
+| Directory | Contents |
+| --- | --- |
+| `transport/` | `stdio.ts` byte transport and `supervisor.ts` process/container supervision |
+| `acp/` | `protocol.ts` ACP JSON-RPC correlation and vendor extensions |
+| `adapter/` | `adapters.ts` per-harness argv, permission modes, and auth probing |
+| `logic/` | `service.ts`/`session.ts` operations and state, plus `config.ts`, `auth.ts`, `create-params.ts`, `errors.ts` |
+| `redact/` | `redact.ts`/`redact-core.ts` on-disk masking and `privacy.ts` account whitelist |
+| `io/` | `persistence.ts` journal/snapshots, `runtime.ts` launch I/O, `preview.ts` cursor paging |
+| `http/` | `server.ts` routing and JSON envelopes |
 
 ```text
 Main agent --HTTP POST--> http/server.ts --> logic/service.ts + logic/session.ts
                                               |
                                               v
-                                  adapter/protocol.ts + adapters.ts
+                                     acp/protocol.ts + adapter/adapters.ts
                                               |
                                               v
                                    transport/stdio.ts --stdio--> harness
@@ -49,9 +62,9 @@ Main agent --HTTP POST--> http/server.ts --> logic/service.ts + logic/session.ts
    decides whether to cancel a message or terminate its harness after an error.
 4. **HTTP** validates JSON requests, routes the operations, and returns JSON envelopes,
    including client disconnects. There is no SSE stream.
-5. **Preview** is an internal, cursorable reader over `raw.jsonl`; it is not exposed over
-   HTTP. Callers observe progress through `message_status`. It has no preview file and
-   retains no rolling text window.
+5. **Preview** (`io/preview.ts`) is an internal, cursorable reader over `raw.jsonl`; it is
+   not exposed over HTTP. Callers observe progress through `message_status`. It has no
+   preview file and retains no rolling text window.
 
 The supervisor owns the local harness process group and SSH/Docker cleanup. Server
 shutdown or loss of its parent/stdio triggers cleanup. One server owns a session directory;

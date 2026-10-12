@@ -2,12 +2,12 @@
 import { appendFileSync, closeSync, existsSync, ftruncateSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { AuthCoordinator, AuthLedger } from "../auth.js";
-import { harnessInfo, type BridgeConfig } from "../config.js";
-import { assertAllowedKeys, normalizeCreateParams } from "../create-params.js";
-import { authenticationRequired, BridgeError, isRecord } from "../errors.js";
-import { isValidSessionId, newSessionId, QUEUE_FILE, RAW_FILE, readJsonFileSafe, RESULTS_DIR, SESSION_FILE, sessionDirectory, writeJsonAtomicSync } from "../persistence.js";
-import { Redactor, collectSecrets } from "../redact.js";
+import { AuthCoordinator, AuthLedger } from "./auth.js";
+import { harnessInfo, type BridgeConfig } from "./config.js";
+import { assertAllowedKeys, normalizeCreateParams } from "./create-params.js";
+import { authenticationRequired, BridgeError, isRecord } from "./errors.js";
+import { isValidSessionId, newSessionId, QUEUE_FILE, RAW_FILE, readJsonFileSafe, RESULTS_DIR, SESSION_FILE, sessionDirectory, writeJsonAtomicSync } from "../io/persistence.js";
+import { Redactor, collectSecrets } from "../redact/redact.js";
 import { HarnessSession } from "./session.js";
 
 export const METHODS = ["ping", "search_harness", "create_session", "close_session", "authenticate", "auth_status", "set_session_options", "send_message", "cancel_message", "message_status", "answer_question"] as const;

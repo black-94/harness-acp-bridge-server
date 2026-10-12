@@ -6,8 +6,8 @@
  * arguments, the environment, the SSH program, or any directory the bridge writes to. Those
  * come from the configuration file only.
  */
-import { isBuiltinHarness, type ContainerPolicy, type PermissionMode, type Runtime } from "./adapters.js";
-import type { DockerMountSpec, DockerPortSpec } from "./runtime.js";
+import { isBuiltinHarness, type ContainerPolicy, type PermissionMode, type Runtime } from "../adapter/adapters.js";
+import type { DockerMountSpec, DockerPortSpec } from "../io/runtime.js";
 
 export class ParamError extends Error {
   override name = "ParamError";

@@ -1,7 +1,7 @@
 /** Service entrypoint. Configuration comes from HARNESS_ACP_BRIDGE_CONFIG or defaults. */
-import { loadConfig } from "./config.js";
+import { loadConfig } from "./logic/config.js";
 import { HarnessHttpServer } from "./http/server.js";
-import { errorInfo } from "./errors.js";
+import { errorInfo } from "./logic/errors.js";
 
 const server = new HarnessHttpServer(loadConfig());
 let stopping = false;

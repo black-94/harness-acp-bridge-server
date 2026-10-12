@@ -9,8 +9,8 @@ import { describe, expect, it } from "vitest";
  * parent instead of hanging the suite, and the test fails with the timing report.
  */
 const root = fileURLToPath(new URL("..", import.meta.url));
-const core = pathToFileURL(join(root, "dist/redact-core.js")).href;
-const redact = pathToFileURL(join(root, "dist/redact.js")).href;
+const core = pathToFileURL(join(root, "dist/redact/redact-core.js")).href;
+const redact = pathToFileURL(join(root, "dist/redact/redact.js")).href;
 
 const PROBE = `
 import { redactText } from ${JSON.stringify(core)};

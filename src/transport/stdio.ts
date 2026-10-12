@@ -2,10 +2,10 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
-import { BridgeError } from "../errors.js";
-import { SessionStore } from "../persistence.js";
-import { type StreamRedactor } from "../redact.js";
-import { SUPERVISOR_SPEC_ENV, type SupervisorSpec } from "../runtime.js";
+import { BridgeError } from "../logic/errors.js";
+import { SessionStore } from "../io/persistence.js";
+import { type StreamRedactor } from "../redact/redact.js";
+import { SUPERVISOR_SPEC_ENV, type SupervisorSpec } from "../io/runtime.js";
 
 export class StdioTransport extends EventEmitter {
   private child: ChildProcessWithoutNullStreams | null = null;
@@ -27,7 +27,7 @@ export class StdioTransport extends EventEmitter {
   }
   start(spec: SupervisorSpec): void {
     if (this.child) throw new BridgeError("already_started", "transport already started");
-    const child = spawn(process.execPath, [fileURLToPath(new URL("../supervisor.js", import.meta.url))], {
+    const child = spawn(process.execPath, [fileURLToPath(new URL("./supervisor.js", import.meta.url))], {
       stdio: ["pipe", "pipe", "pipe"], detached: true,
       env: { ...process.env, [SUPERVISOR_SPEC_ENV]: JSON.stringify(spec) },
     });

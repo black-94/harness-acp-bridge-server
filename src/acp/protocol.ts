@@ -1,8 +1,8 @@
 /** ACP JSON-RPC and harness extensions. No scheduling, deadlines, or persistence. */
 import { readFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
-import { BridgeError, isRecord } from "../errors.js";
-import { type AdapterClient, type HarnessAdapter } from "../adapters.js";
+import { BridgeError, isRecord } from "../logic/errors.js";
+import { type AdapterClient, type HarnessAdapter } from "../adapter/adapters.js";
 import { StdioTransport } from "../transport/stdio.js";
 
 export const CLIENT_VERSION: string = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")).version;

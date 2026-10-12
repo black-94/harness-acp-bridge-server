@@ -2,10 +2,10 @@ import { appendFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SessionStore } from "../src/persistence";
+import { SessionStore } from "../src/io/persistence";
 import { StdioTransport } from "../src/transport/stdio";
-import { readPreview } from "../src/preview/reader";
-import { decodeLine } from "../src/adapter/protocol";
+import { readPreview } from "../src/io/preview";
+import { decodeLine } from "../src/acp/protocol";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });

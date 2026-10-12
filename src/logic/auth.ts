@@ -21,8 +21,8 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import { BridgeError, errorInfo } from "./errors.js";
-import { readJsonFileSafe, writeAtomicFileSync } from "./persistence.js";
-import { validateObjectSchema } from "./adapter/protocol.js";
+import { readJsonFileSafe, writeAtomicFileSync } from "../io/persistence.js";
+import { validateObjectSchema } from "../acp/protocol.js";
 
 export interface RateLimitSettings {
   enabled: boolean;

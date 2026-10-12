@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { Redactor, StreamRedactor, collectSecrets, redactBytes, redactValue } from "../src/redact";
-import { isSensitiveKeyName, redactText } from "../src/redact-core";
+import { Redactor, StreamRedactor, collectSecrets, redactBytes, redactValue } from "../src/redact/redact";
+import { isSensitiveKeyName, redactText } from "../src/redact/redact-core";
 
 const SENTINEL = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
 

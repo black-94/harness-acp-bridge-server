@@ -1,8 +1,8 @@
 /** Stateless paging of the raw journal. Cursor includes position within a rendered event. */
 import { closeSync, lstatSync, openSync, readSync } from "node:fs";
-import { BridgeError, isRecord } from "../errors.js";
-import { decodeLine, describeFrame, type OutputEvent } from "../adapter/protocol.js";
-import { type RawEvent } from "../persistence.js";
+import { BridgeError, isRecord } from "../logic/errors.js";
+import { decodeLine, describeFrame, type OutputEvent } from "../acp/protocol.js";
+import { type RawEvent } from "./persistence.js";
 
 interface Cursor { v: 1; session: string; message: string | null; offset: number; item: number; char: number }
 export interface PreviewEvent { type: string; text: string; seq: number; timestamp: string; message_id: string | null; complete: boolean; data?: unknown }

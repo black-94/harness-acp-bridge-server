@@ -1,4 +1,4 @@
-import { Redactor, collectSecrets } from "./redact.js";
+import { Redactor, collectSecrets } from "../redact/redact.js";
 
 export class BridgeError extends Error {
   override name = "BridgeError";

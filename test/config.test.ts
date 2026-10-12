@@ -15,7 +15,7 @@ import {
   harnessInfo,
   loadConfig,
   type BridgeConfig,
-} from "../src/config";
+} from "../src/logic/config";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {

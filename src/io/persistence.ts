@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { Redactor } from "./redact.js";
+import { Redactor } from "../redact/redact.js";
 
 export const RAW_FILE = "raw.jsonl";
 export const SESSION_FILE = "session.json";
