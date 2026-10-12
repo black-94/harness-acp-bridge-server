@@ -14,7 +14,7 @@ import { Redactor, collectSecrets } from "../redact/redact.js";
 import { StdioTransport } from "../transport/stdio.js";
 import { inspectContainer, newRemotePidFile, type LaunchSpec } from "../io/runtime.js";
 import { resolveLocalCommand } from "../io/commands.js";
-import { assertHarnessIdentity, HARNESS_COMMANDS, type LaunchTemplate } from "./templates.js";
+import { assertHarnessIdentity, HARNESS_COMMANDS } from "./templates.js";
 
 export type MessageState = "running" | "waiting_input" | "cancelling" | "completed" | "failed" | "cancelled";
 interface Message {
@@ -79,19 +79,19 @@ export class HarnessSession {
   private lastTransportEventAt: number | null = null;
   private lastProgressAt: number | null = null;
   private observedPhase: string | null = null;
-  constructor(readonly config: BridgeConfig, readonly params: CreateSessionParams, sessionId: string, redactor?: Redactor, private readonly template: LaunchTemplate | null = null) {
+  constructor(readonly config: BridgeConfig, readonly params: CreateSessionParams, sessionId: string, redactor?: Redactor) {
     const harness = resolveHarness(config, params.harness);
     this.sessionId = sessionId;
     this.adapter = getAdapter(harness.name);
     this.modelId = params.modelId; this.thinkingLevel = params.thinkingLevel; this.permissionMode = params.permissionMode;
     this.assertThinkingLevel(params.modelId, params.thinkingLevel);
-    const env = template?.env ?? {};
-    let command = template?.command || HARNESS_COMMANDS[harness.name];
+    const env = params.env;
+    let command = params.command || HARNESS_COMMANDS[harness.name];
     if (!command) throw new BridgeError("invalid_harness_command", "no built-in executable for selected harness");
     if (params.target === "local" && params.runtime === "direct") command = resolveLocalCommand(command, env, params.cwd);
     this.adapterConfig = {
       harness: harness.name, cwd: params.cwd, modelId: params.modelId,
-      command, args: template?.args ?? [], env,
+      command, args: params.args, env,
       launchMode: params.target === "remote" ? "ssh" : "local", runtime: params.runtime,
       permissionMode: params.permissionMode, acpModeId: config.launch.agyModeIds[params.permissionMode] ?? null,
       sshHost: params.remoteHost, dockerImage: params.dockerImage, reuseContainer: Boolean(params.dockerId),
@@ -215,7 +215,7 @@ export class HarnessSession {
   options(): Record<string, unknown> { return { model_id: this.modelId, thinking_level: this.thinkingLevel, permission_mode: this.permissionMode }; }
   snapshot(): Record<string, unknown> {
     this.launchInfo = readJsonFileSafe(this.metadataPath) ?? this.launchInfo;
-    return { version: 2, session_id: this.sessionId, harness: this.adapter.name, template: this.template?.name ?? null, state: this.state,
+    return { version: 2, session_id: this.sessionId, harness: this.adapter.name, state: this.state,
       operation: this.operation, created_at: this.createdAt, updated_at: iso(), last_activity_at: new Date(this.lastActivity).toISOString(),
       activity: this.activity(),
       cwd: this.params.cwd, target: this.params.target, runtime: this.params.runtime,

@@ -1,10 +1,18 @@
-/** Persistent administrator-owned launch templates; never executed during registration. */
+/**
+ * Persistent administrator-owned launch templates; validated but never executed during
+ * registration.
+ *
+ * Templates are **information only**: `create_session` no longer references a template, merges its
+ * defaults, or records a selected template's identity. A caller (typically an LLM) reads a template,
+ * drops `name`/`description` and fields that do not apply, and passes the allowed fields directly to
+ * `create_session`. Registration/search/delete exist to store and serve that information.
+ */
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import { getAdapter } from "../adapter/adapters.js";
 import { writeJsonAtomicSync } from "../io/persistence.js";
-import { normalizeCreateParams } from "./create-params.js";
+import { normalizeArgs, normalizeCommand, normalizeCreateParams, normalizeEnv } from "./create-params.js";
 import { BridgeError } from "./errors.js";
 
 const text = z.string().refine(value => !value.includes("\0"), "must not contain NUL");
@@ -54,6 +62,12 @@ export function assertHarnessIdentity(harness: string, response: Record<string, 
   }
 }
 
+/**
+ * Template fields projected into the launch-parameter validator, used **only** by
+ * `validateTemplate` to prove a template is launchable. It is no longer consumed by
+ * `create_session` (which takes explicit parameters), so a template's Docker fields are merged here
+ * purely to exercise the same Docker rules the session path uses.
+ */
 export function templateDefaults(template: LaunchTemplate): Record<string, unknown> {
   return {
     harness: template.harness, runtime: template.runtime,
@@ -69,11 +83,14 @@ export function validateTemplate(raw: unknown): LaunchTemplate {
   const parsed = templateSchema.safeParse(raw);
   if (!parsed.success) throw new BridgeError("invalid_template", "invalid launch template", parsed.error.issues);
   const template = parsed.data;
-  if (template.command !== null) {
-    template.command = template.command.trim() || null;
-    if (template.command && (template.command.startsWith("-") || (!template.command.startsWith("/") && /[/\s]/.test(template.command)))) {
-      throw new BridgeError("invalid_template", "command must be an absolute executable path or a single executable name");
-    }
+  // Reuse the exact launch-parameter validation that `create_session` uses, so a command/args/env
+  // accepted here is accepted there too (and vice versa) — no forked validators.
+  try {
+    template.command = normalizeCommand(template.command);
+    template.args = normalizeArgs(template.args);
+    template.env = normalizeEnv(template.env);
+  } catch (error) {
+    throw new BridgeError("invalid_template", error instanceof Error ? error.message : String(error));
   }
   if (template.runtime === "direct" && (template.docker_image !== null || template.container_policy !== undefined ||
       template.login_dirs.length || template.mounts.length || template.ports.length || template.host_network)) {

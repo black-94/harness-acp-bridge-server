@@ -89,10 +89,10 @@ async function setup(harnessEnv: Record<string, string>, extra: Record<string, u
   cleanup.push(async () => { await server.stop(); rmSync(directory, { recursive: true, force: true }); });
   const base = `http://127.0.0.1:${address.port}`;
   const request = async (method: string, params: Record<string, unknown> = {}) => {
-    const response = await fetch(`${base}/api/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(method === "create_session" ? { template: "fixture", ...params } : params) });
+    const body = method === "create_session" ? { command: process.execPath, args: [fixture], env: harnessEnv, ...params } : params;
+    const response = await fetch(`${base}/api/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     return { status: response.status, ...(await response.json() as any) };
   };
-  expect((await request("register_template", { template: { name: "fixture", harness: "codebuddy", command: process.execPath, args: [fixture], env: harnessEnv } })).ok).toBe(true);
   const create = async () => {
     const response = await request("create_session", { cwd: directory, model_id: "fake-model" });
     expect(response.ok, JSON.stringify(response)).toBe(true); return response.data.session_id as string;

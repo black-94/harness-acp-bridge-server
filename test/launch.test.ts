@@ -607,6 +607,9 @@ describe("create_session parameter validation", () => {
     const params = normalizeCreateParams(base);
     expect(params).toMatchObject({
       harness: null,
+      command: null,
+      args: [],
+      env: {},
       target: "local",
       runtime: "direct",
       permissionMode: "auto",
@@ -621,6 +624,74 @@ describe("create_session parameter validation", () => {
     const reuse = normalizeCreateParams({ ...base, cwd: "/work", runtime: "docker", docker_id: "e".repeat(64) });
     expect(reuse.containerPolicy).toBe("keep");
     expect(reuse.dockerId).toBe("e".repeat(64));
+  });
+
+  it("accepts a launch command, args, and env as direct session parameters", () => {
+    const params = normalizeCreateParams({
+      ...base,
+      command: " /usr/local/bin/codebuddy ",
+      args: ["--verbose", "x"],
+      env: { HOME: "/home/me", PATH: "/bin" },
+    });
+    expect(params.command).toBe("/usr/local/bin/codebuddy");
+    expect(params.args).toEqual(["--verbose", "x"]);
+    expect(params.env).toEqual({ HOME: "/home/me", PATH: "/bin" });
+    // Empty/whitespace command means the built-in executable.
+    expect(normalizeCreateParams({ ...base, command: "  " }).command).toBeNull();
+    expect(normalizeCreateParams({ ...base, command: "" }).command).toBeNull();
+    expect(normalizeCreateParams({ ...base, command: null }).command).toBeNull();
+  });
+
+  it("rejects an unsafe command, a non-string argv element, and an invalid env map", () => {
+    for (const command of ["cmd --arg", "-cmd", "relative/path", "a\0b"]) {
+      expectCode({ ...base, command }, "invalid_param");
+    }
+    expectCode({ ...base, command: 1 }, "invalid_param");
+    expectCode({ ...base, args: "nope" }, "invalid_param");
+    expectCode({ ...base, args: ["ok", 1] }, "invalid_param");
+    expectCode({ ...base, args: ["a\0b"] }, "invalid_param");
+    expectCode({ ...base, env: { "BAD-NAME": "x" } }, "invalid_param");
+    expectCode({ ...base, env: { OK: 1 } }, "invalid_param");
+    expectCode({ ...base, env: { OK: "a\0b" } }, "invalid_param");
+    expectCode({ ...base, env: "nope" }, "invalid_param");
+  });
+
+  it("rejects managed adapter flags and detaching arguments passed as session args", () => {
+    for (const value of ["--acp", "--model=x", "-p", "--print", "--acp-transport=stdio"]) {
+      expectCode({ ...base, harness: "codebuddy", args: [value] }, "invalid_param");
+    }
+    for (const value of ["--bg", "--tmux", "--serve", "setsid", "--background=1"]) {
+      expectCode({ ...base, args: [value] }, "invalid_param");
+    }
+    // A non-managed harness still refuses detaching arguments but allows ordinary flags.
+    expect(normalizeCreateParams({ ...base, harness: "codex", args: ["--verbose"] }).args).toEqual(["--verbose"]);
+  });
+
+  it("rejects NUL anywhere it would reach an exec string, at normalization time", () => {
+    expectCode({ ...base, cwd: "/work\0bad" }, "invalid_param");
+    expectCode({ ...base, model_id: "m\0odel" }, "invalid_param");
+    expectCode({ ...base, thinking_level: "hi\0gh" }, "invalid_param");
+    expectCode({ ...base, target: "remote", remote_host: "host\0name" }, "invalid_param");
+    const docker = { ...base, cwd: "/work", runtime: "docker", docker_image: "img" };
+    expectCode({ ...docker, docker_image: "img\0bad" }, "invalid_param");
+    expectCode({ ...base, runtime: "direct", docker_image: "img\0bad" }, "invalid_param");
+    expectCode({ ...docker, mounts: [{ source: "/src\0bad", target: "/b" }] }, "invalid_param");
+    expectCode({ ...docker, mounts: [{ source: "/a", target: "/b\0ad" }] }, "invalid_param");
+    expectCode({ ...docker, login_dirs: [{ source: "/src\0bad", target: "/creds" }] }, "invalid_param");
+    expectCode({ ...base, command: "a\0b" }, "invalid_param");
+    expectCode({ ...base, args: ["a\0b"] }, "invalid_param");
+    expectCode({ ...base, env: { OK: "a\0b" } }, "invalid_param");
+  });
+
+  it("preserves legal env keys that collide with Object prototype members", () => {
+    // JSON.parse creates real OWN "__proto__" data properties; the assignment form would drop them.
+    const env = JSON.parse('{"__proto__":"ok","constructor":"ctor","toString":"str","NORMAL":"n"}');
+    const params = normalizeCreateParams({ ...base, env });
+    expect(Object.getOwnPropertyNames(params.env).sort()).toEqual(["NORMAL", "__proto__", "constructor", "toString"]);
+    expect(Object.entries(params.env)).toEqual(expect.arrayContaining([
+      ["__proto__", "ok"], ["constructor", "ctor"], ["toString", "str"], ["NORMAL", "n"],
+    ]));
+    expect(Object.getPrototypeOf(params.env)).toBe(Object.prototype);
   });
 
   it("accepts thinking_level and rejects empty or non-string levels", () => {
@@ -643,10 +714,12 @@ describe("create_session parameter validation", () => {
     expect(params.dockerMounts).toEqual([{ source: "/h", target: "/c", read_only: true }]);
   });
 
-  it("refuses launch internals", () => {
-    for (const key of ["command", "args", "env", "ssh_host", "ssh_command", "launch_mode", "base_dir", "entrypoint"]) {
+  it("refuses the remaining launch internals and any template reference", () => {
+    for (const key of ["ssh_host", "ssh_command", "ssh_args", "launch_mode", "base_dir", "entrypoint", "state_dir", "session_dir", "metadata_path"]) {
       expectCode({ ...base, [key]: "x" }, "launch_internal");
     }
+    // Templates are information only: a create_session caller must never name one.
+    expectCode({ ...base, template: "buddy" }, "unknown_param");
   });
 
   it("refuses unknown parameters and bad harness names", () => {
@@ -659,10 +732,11 @@ describe("create_session parameter validation", () => {
     expectCode({ ...base, runtime: "podman" }, "invalid_param");
   });
 
-  it("refuses docker options on a direct runtime", () => {
+  it("refuses effective docker options on a direct runtime but accepts neutral defaults", () => {
     for (const extra of [
       { docker_image: "img" },
       { docker_id: "f".repeat(64) },
+      { login_dirs: [{ source: "/a", target: "/b" }] },
       { mounts: [{ source: "/a", target: "/b" }] },
       { ports: [{ host_port: 1, container_port: 2 }] },
       { host_network: true },
@@ -670,6 +744,16 @@ describe("create_session parameter validation", () => {
     ]) {
       expectCode({ ...base, ...extra }, "invalid_param");
     }
+    // Neutral defaults for template expansion are legal on a direct runtime...
+    expect(normalizeCreateParams({ ...base, runtime: "direct", docker_image: null, container_policy: null,
+      login_dirs: [], mounts: [], ports: [], host_network: false }).runtime).toBe("direct");
+    // ...but their *types* are still validated, never silently ignored.
+    expectCode({ ...base, mounts: "nope" }, "invalid_param");
+    expectCode({ ...base, login_dirs: {} }, "invalid_param");
+    expectCode({ ...base, ports: "nope" }, "invalid_param");
+    expectCode({ ...base, docker_image: 1 }, "invalid_param");
+    expectCode({ ...base, host_network: "yes" }, "invalid_param");
+    expectCode({ ...base, container_policy: "maybe" }, "invalid_param");
   });
 
   it("refuses invalid or conflicting docker launches", () => {
@@ -679,9 +763,10 @@ describe("create_session parameter validation", () => {
     expectCode({ ...base, runtime: "docker", cwd: "work", docker_image: "img" }, "invalid_param");
     expectCode({ ...base, runtime: "docker", cwd: "/work", docker_id: "short" }, "invalid_param");
     expectCode({ ...base, runtime: "docker", cwd: "/work", docker_id: id.toUpperCase() }, "invalid_param");
-    // Reuse conflicts with new-container options.
+    // Reuse conflicts with new-container options, including login_dirs.
     expectCode({ ...base, runtime: "docker", cwd: "/work", docker_id: id, docker_image: "img" }, "invalid_param");
     expectCode({ ...base, runtime: "docker", cwd: "/work", docker_id: id, host_network: true }, "invalid_param");
+    expectCode({ ...base, runtime: "docker", cwd: "/work", docker_id: id, login_dirs: [{ source: "/a", target: "/b" }] }, "invalid_param");
     expectCode(
       { ...base, runtime: "docker", cwd: "/work", docker_id: id, ports: [{ host_port: 1, container_port: 2 }] },
       "invalid_param",
@@ -727,6 +812,32 @@ describe("create_session parameter validation", () => {
     expectCode({ ...docker, ports: [{ host_port: 1, container_port: 2, protocol: "icmp" }] }, "invalid_param");
     expectCode({ ...docker, ports: [{ host_port: 1, container_port: 2, host_ip: "1.2.3" }] }, "invalid_param");
     expectCode({ ...docker, ports: [{ host_port: 1, container_port: 2, unexpected: true }] }, "invalid_param");
+  });
+
+  it("merges login_dirs with mounts for Docker, enforcing unique targets and the total cap", () => {
+    const docker = { ...base, cwd: "/work", runtime: "docker", docker_image: "img" };
+    const merged = normalizeCreateParams({
+      ...docker,
+      login_dirs: [{ source: "/creds", target: "/root/.creds", read_only: true }],
+      mounts: [{ source: "/repo", target: "/work", read_only: false }],
+    });
+    expect(merged.dockerMounts).toEqual([
+      { source: "/creds", target: "/root/.creds", read_only: true },
+      { source: "/repo", target: "/work", read_only: false },
+    ]);
+    // A target repeated across the two lists is rejected.
+    expectCode({
+      ...docker,
+      login_dirs: [{ source: "/creds", target: "/same" }],
+      mounts: [{ source: "/repo", target: "/same" }],
+    }, "invalid_param");
+    // The combined total is capped, even though each list is within the per-list bound.
+    const half = Array.from({ length: 40 }, (_, i) => ({ source: `/h/${i}`, target: `/t/${i}` }));
+    expectCode({ ...docker, login_dirs: half, mounts: half }, "invalid_param");
+    // login_dirs entries are validated like mounts.
+    expectCode({ ...docker, login_dirs: [{ source: "rel", target: "/b" }] }, "invalid_param");
+    expectCode({ ...docker, login_dirs: [{ source: "/a", target: "/b", read_only: "yes" }] }, "invalid_param");
+    expectCode({ ...docker, login_dirs: [{ source: "/a", target: "/b", extra: 1 }] }, "invalid_param");
   });
 
   it("checks the target/remote_host pairing", () => {

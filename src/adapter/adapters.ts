@@ -25,6 +25,7 @@ export class AuthStatusUnsupported extends Error {
 }
 
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** Arguments that would detach the harness from the supervised process group. */
 const DETACH_ARGS = new Set(["--bg", "--background", "--tmux", "--tmux-classic", "--serve"]);
 const CODEBUDDY_MANAGED = new Set([
   "--acp",
@@ -37,6 +38,31 @@ const CODEBUDDY_MANAGED = new Set([
   "-p",
 ]);
 const PERMISSION_MODES: readonly PermissionMode[] = ["read", "edit", "auto", "yolo"];
+
+/**
+ * Shared launch-argv safety check used by both template registration and `create_session`
+ * normalization, so a managed/detaching argument is rejected before a session ever starts.
+ *
+ * Detaching arguments are refused for every harness; CodeBuddy's adapter-owned flags (which the
+ * adapter injects itself) can never be overridden by a caller. A null harness means the server's
+ * default harness is not yet known, so only the universal detach rule applies here — the adapter's
+ * own `validate` still enforces the harness-specific rule once the harness is resolved.
+ */
+export function assertLaunchArgs(harness: string | null, args: readonly string[]): void {
+  for (const value of args) {
+    const flag = value.split("=", 1)[0] ?? "";
+    assert(
+      !DETACH_ARGS.has(flag) && value !== "setsid",
+      `argument may detach from the managed process group: ${value}`,
+    );
+  }
+  if (harness === "codebuddy") {
+    for (const value of args) {
+      const flag = value.split("=", 1)[0] ?? "";
+      assert(!CODEBUDDY_MANAGED.has(flag), `CodeBuddy argument is managed by the adapter: ${value}`);
+    }
+  }
+}
 
 const CODEBUDDY_MODE_FLAGS: Record<PermissionMode, string> = {
   read: "plan",
@@ -168,13 +194,7 @@ abstract class BaseAdapter implements HarnessAdapter {
     for (const name of Object.keys(config.env)) {
       assert(ENV_NAME.test(name), `invalid environment variable name: ${JSON.stringify(name)}`);
     }
-    for (const value of config.args) {
-      const flag = value.split("=", 1)[0] ?? "";
-      assert(
-        !DETACH_ARGS.has(flag) && value !== "setsid",
-        `argument may detach from the managed process group: ${value}`,
-      );
-    }
+    assertLaunchArgs(this.name, config.args);
   }
 
   buildArgv(config: AdapterConfig): string[] {
@@ -260,14 +280,8 @@ export class CodeBuddyAdapter extends BaseAdapter {
   }
 
   override validate(config: AdapterConfig): void {
+    // BaseAdapter.validate already applies the CodeBuddy managed-flag rule (via assertLaunchArgs).
     super.validate(config);
-    for (const value of config.args) {
-      const flag = value.split("=", 1)[0] ?? "";
-      assert(
-        !CODEBUDDY_MANAGED.has(flag),
-        `CodeBuddy argument is managed by the adapter: ${value}`,
-      );
-    }
   }
 
   override buildArgv(config: AdapterConfig): string[] {

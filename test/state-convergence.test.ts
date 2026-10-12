@@ -38,10 +38,10 @@ async function setup(settings: Record<string, unknown> = {}) {
   const address = await server.start();
   cleanup.push(async () => { await server.stop(); rmSync(directory, { recursive: true, force: true }); });
   const request = async (method: string, params: Record<string, unknown> = {}) => {
-    const response = await fetch(`http://127.0.0.1:${address.port}/api/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(method === "create_session" ? { template: "fixture", ...params } : params) });
+    const body = method === "create_session" ? { command: process.execPath, args: [fixture], ...params } : params;
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     return { status: response.status, ...(await response.json() as any) };
   };
-  expect((await request("register_template", { template: { name: "fixture", harness: "codebuddy", command: process.execPath, args: [fixture] } })).ok).toBe(true);
   const create = async () => (await request("create_session", { cwd: directory, model_id: "fake-model" })).data.session_id as string;
   const waitTerminal = async (session: string, message: string) => {
     const end = Date.now() + 6000;

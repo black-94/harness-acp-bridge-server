@@ -3,17 +3,18 @@ import { appendFileSync, closeSync, existsSync, ftruncateSync, lstatSync, mkdirS
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { AuthCoordinator, AuthLedger } from "./auth.js";
-import { harnessInfo, type BridgeConfig } from "./config.js";
+import { assertLaunchArgs } from "../adapter/adapters.js";
+import { harnessInfo, resolveHarness, type BridgeConfig } from "./config.js";
 import { assertAllowedKeys, normalizeCreateParams } from "./create-params.js";
 import { authenticationRequired, BridgeError, isRecord } from "./errors.js";
 import { isValidSessionId, newSessionId, QUEUE_FILE, RAW_FILE, readJsonFileSafe, RESULTS_DIR, SESSION_FILE, sessionDirectory, writeJsonAtomicSync } from "../io/persistence.js";
 import { Redactor, collectSecrets } from "../redact/redact.js";
 import { HarnessSession } from "./session.js";
-import { TemplateRegistry, templateDefaults } from "./templates.js";
+import { TemplateRegistry } from "./templates.js";
 
 export const METHODS = ["ping", "search_harness", "register_template", "delete_template", "search_template", "create_session", "close_session", "authenticate", "auth_status", "set_session_options", "send_message", "cancel_message", "message_status", "answer_question"] as const;
-/** Bumped when the public HTTP contract changes incompatibly (interactive auth, no live_output). */
-export const PROTOCOL_VERSION = 3;
+/** Bumped when the public HTTP contract changes incompatibly (`create_session` no longer references a template). */
+export const PROTOCOL_VERSION = 4;
 export interface RequestContext { signal?: AbortSignal }
 function string(params: Record<string, unknown>, key: string, optional = false, opaque = false): string | null {
   const value = params[key];
@@ -129,29 +130,24 @@ export class HarnessService {
         assertAllowedKeys(params, ["query", "harness", "name"]);
         return { templates: this.templates.search(string(params, "query", true), string(params, "harness", true), string(params, "name", true)) };
       case "create_session": {
-        const templateName = string(params, "template", true);
-        const template = templateName ? this.templates.get(templateName) : null;
-        const { template: ignored, ...requested } = params;
-        if (template && params.harness !== undefined && params.harness !== null && params.harness !== template.harness) {
-          throw new BridgeError("invalid_param", "harness must match the selected template");
+        // Templates are information only: `create_session` never references, looks up, merges, or
+        // records one. A `template` key is rejected as an unsupported parameter.
+        const options = normalizeCreateParams(params);
+        // `normalizeCreateParams` validates managed/detaching args only when the harness is explicit;
+        // resolve the effective (possibly default) harness and re-check before any SessionStore or
+        // launch, so a default-harness `--acp`/`--model` returns `invalid_param` (400) rather than the
+        // adapter's internal error. This reuses `assertLaunchArgs` — it does not copy the flag table
+        // and does not reclassify unrelated adapter errors.
+        try {
+          assertLaunchArgs(resolveHarness(this.config, options.harness).name, options.args);
+        } catch (error) {
+          throw new BridgeError("invalid_param", error instanceof Error ? error.message : String(error));
         }
-        const defaults = template ? templateDefaults(template) : {};
-        // Changing a remote template to local must not carry its inherited SSH host along.
-        // An explicitly supplied remote_host is still validated rather than silently discarded.
-        if (template && params.target === "local") defaults.remote_host = null;
-        // Reused containers fix their own image/mounts/ports/network; do not inject new-container defaults.
-        if (requested.docker_id !== undefined && requested.docker_id !== null) {
-          for (const key of ["docker_image", "mounts", "ports", "host_network"]) delete defaults[key];
-        }
-        const options = normalizeCreateParams({ ...defaults, ...requested,
-          ...(template ? { harness: template.harness, runtime: params.runtime ?? template.runtime,
-            target: params.target ?? template.target } : {}) });
-        if (template && options.runtime !== template.runtime) throw new BridgeError("invalid_param", "runtime must match the selected template");
         if ([...this.sessions.values()].filter(session => !session.isClosed).length >= this.config.sessions.maxConcurrency) throw new BridgeError("session_limit", "maximum live session count reached");
         const id = options.sessionId ?? newSessionId();
         if (!isValidSessionId(id)) throw new BridgeError("invalid_param", "invalid session_id");
         if (this.sessions.has(id) || existsSync(sessionDirectory(this.config.paths.sessionDir, id))) throw new BridgeError("session_exists", "session_id already exists");
-        const session = new HarnessSession(this.config, options, id, undefined, template);
+        const session = new HarnessSession(this.config, options, id);
         this.sessions.set(id, session);
         await session.initialize();
         // `create_session.authenticate` no longer exists (it bypassed the flow). An unauthenticated

@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -118,7 +118,8 @@ async function app() {
   return { dir, config, server, request };
 }
 
-describe("template HTTP API and create_session identity checks", () => {
+describe("template HTTP API and decoupled create_session", () => {
+  const launch = { command: process.execPath, args: [fixture, "--fake-agent=codebuddy"] };
   it("registers, searches, deletes and restores templates without launching a harness", async () => {
     const api = await app();
     expect((await api.request("register_template", { template: { ...base, typo: true } })).status).toBe(400);
@@ -129,67 +130,55 @@ describe("template HTTP API and create_session identity checks", () => {
     expect(new TemplateRegistry(api.config.paths.stateDir).get("buddy").harness).toBe("codebuddy");
     expect((await api.request("delete_template", { name: "buddy" })).data.deleted).toBe(true);
     expect((await api.request("delete_template", { name: "buddy" })).status).toBe(404);
-    expect((await api.request("create_session", { template: "buddy", cwd: api.dir, model_id: "fake-model" })).status).toBe(404);
+    // create_session never references a template: naming one is an unsupported parameter.
+    const rejected = await api.request("create_session", { template: "buddy", cwd: api.dir, model_id: "fake-model" });
+    expect(rejected.status).toBe(400);
+    expect(rejected.error.code).toBe("unknown_param");
   });
-  it("prefers a template command and cwd, and refuses command overrides or harness mismatches", async () => {
+  it("starts a harness from direct launch parameters, reports no template identity, and honors a cwd override", async () => {
     const api = await app();
-    await api.request("register_template", { template: { ...base, command: process.execPath, args: [fixture], cwd: api.dir } });
-    const result = await api.request("create_session", { template: "buddy", model_id: "fake-model" });
-    expect(result.ok, JSON.stringify(result)).toBe(true); expect(result.data.template).toBe("buddy");
-    expect((await api.request("create_session", { template: "buddy", model_id: "fake-model", command: "evil" })).error.code).toBe("launch_internal");
-    expect((await api.request("create_session", { template: "buddy", model_id: "fake-model", harness: "codex" })).error.code).toBe("invalid_param");
-    await api.request("delete_template", { name: "buddy" });
-    // Deletion cannot alter a launch snapshot already accepted by a session.
-    expect((await api.request("send_message", { session_id: result.data.session_id, text: "still-live" })).ok).toBe(true);
+    const created = await api.request("create_session", { ...launch, cwd: api.dir, model_id: "fake-model" });
+    expect(created.ok, JSON.stringify(created)).toBe(true);
+    expect(created.data.cwd).toBe(api.dir);
+    // The snapshot carries no selected-template identity.
+    expect(created.data.template).toBeUndefined();
+    expect((await api.request("send_message", { session_id: created.data.session_id, text: "direct" })).ok).toBe(true);
+    await api.request("close_session", { session_id: created.data.session_id });
+    // A distinct existing absolute directory, so the override cannot be confused with a default.
+    const overrideDir = join(api.dir, "override-cwd"); mkdirSync(overrideDir, { recursive: true });
+    const overridden = await api.request("create_session", { ...launch, cwd: overrideDir, model_id: "fake-model" });
+    expect(overridden.ok, JSON.stringify(overridden)).toBe(true);
+    expect(overridden.data.cwd).toBe(overrideDir);
+    expect(overridden.data.cwd).not.toBe(api.dir);
+    await api.request("close_session", { session_id: overridden.data.session_id });
   });
-  it.each(["direct", "docker"])("inherits a remote %s template's target/host and allows overrides", async runtime => {
+  it.each(["direct", "docker"])("launches a remote %s session from direct parameters and validates the host pairing", async runtime => {
     const api = await app(); const sshLog = join(api.dir, "ssh.log"); vi.stubEnv("MOCK_SSH_LOG", sshLog);
-    const registered = await api.request("register_template", { template: { ...base, runtime,
-      target: "remote", remote_host: "template-host", command: process.execPath, args: [fixture], cwd: api.dir,
-      ...(runtime === "docker" ? { docker_image: "mock/image:1" } : {}) } });
-    expect(registered.ok, JSON.stringify(registered)).toBe(true);
-    for (const overrides of [{}, { remote_host: "override-host" }, { target: "local" }]) {
-      const created = await api.request("create_session", { template: "buddy", model_id: "fake-model", ...overrides });
-      expect(created.ok, JSON.stringify(created)).toBe(true);
-      expect(created.data).toMatchObject({ runtime,
-        target: overrides.target ?? "remote", remote_host: overrides.target === "local" ? null : overrides.remote_host ?? "template-host" });
-      await api.request("close_session", { session_id: created.data.session_id });
-    }
-    expect(readFileSync(sshLog, "utf8")).toContain("template-host");
-    expect(readFileSync(sshLog, "utf8")).toContain("override-host");
-    expect((await api.request("create_session", { template: "buddy", model_id: "fake-model", target: "local", remote_host: "invalid-local-host" })).error.code).toBe("invalid_param");
+    const created = await api.request("create_session", { ...launch, model_id: "fake-model", cwd: api.dir, runtime,
+      target: "remote", remote_host: "request-host", ...(runtime === "docker" ? { docker_image: "mock/image:1" } : {}) });
+    expect(created.ok, JSON.stringify(created)).toBe(true);
+    expect(created.data).toMatchObject({ runtime, target: "remote", remote_host: "request-host" });
+    await api.request("close_session", { session_id: created.data.session_id });
+    expect(readFileSync(sshLog, "utf8")).toContain("request-host");
+    // A local target must not carry a remote host.
+    expect((await api.request("create_session", { ...launch, model_id: "fake-model", cwd: api.dir, target: "local", remote_host: "invalid-local-host" })).error.code).toBe("invalid_param");
+    // A remote target requires one.
+    expect((await api.request("create_session", { ...launch, model_id: "fake-model", cwd: api.dir, target: "remote" })).error.code).toBe("invalid_param");
   });
-  it("requires a host when overriding a local template to remote and inherits permission mode", async () => {
-    const api = await app();
-    await api.request("register_template", { template: { ...base, command: process.execPath, args: [fixture], cwd: api.dir, permission_mode: "read" } });
-    expect((await api.request("create_session", { template: "buddy", model_id: "fake-model", target: "remote" })).error.code).toBe("invalid_param");
-    for (const permission of [undefined, "edit"]) {
-      const created = await api.request("create_session", { template: "buddy", model_id: "fake-model", target: "remote", remote_host: "request-host",
-        ...(permission ? { permission_mode: permission } : {}) });
-      expect(created.ok, JSON.stringify(created)).toBe(true);
-      expect(created.data.options.permission_mode).toBe(permission ?? "read");
-      await api.request("close_session", { session_id: created.data.session_id });
-    }
-  });
-  it("falls back to PATH for an empty template command and for no template", async () => {
+  it("uses the built-in PATH executable when command is omitted, and rejects a missing explicit command", async () => {
     const api = await app(); const executable = join(api.dir, "codebuddy");
     writeFileSync(executable, `#!/bin/sh\nexec ${shellJoin([process.execPath, fixture])} "$@"\n`, { mode: 0o700 });
     vi.stubEnv("PATH", api.dir);
-    await api.request("register_template", { template: { ...base, command: "" } });
-    for (const template of ["buddy", undefined]) {
-      const result = await api.request("create_session", { ...(template ? { template } : {}), cwd: api.dir, model_id: "fake-model" });
-      expect(result.ok, JSON.stringify(result)).toBe(true);
-      await api.request("close_session", { session_id: result.data.session_id });
-    }
-    await api.request("register_template", { template: { ...base, name: "bad-path", command: "/missing/codebuddy" } });
-    expect((await api.request("create_session", { template: "bad-path", cwd: api.dir, model_id: "fake-model" })).error.code).toBe("command_not_found");
+    const fromPath = await api.request("create_session", { cwd: api.dir, model_id: "fake-model" });
+    expect(fromPath.ok, JSON.stringify(fromPath)).toBe(true);
+    await api.request("close_session", { session_id: fromPath.data.session_id });
+    expect((await api.request("create_session", { cwd: api.dir, model_id: "fake-model", command: "/missing/codebuddy" })).error.code).toBe("command_not_found");
     vi.stubEnv("PATH", "/does-not-exist");
     expect((await api.request("create_session", { cwd: api.dir, model_id: "fake-model" })).error.code).toBe("command_not_found");
   });
   it.each(["--fake-agent=codex-acp", "--no-agent-info", "--initialize-auth-required"])("rejects an executable with invalid identity (%s) before session/new", async flag => {
     const api = await app();
-    await api.request("register_template", { template: { ...base, command: process.execPath, args: [fixture, flag] } });
-    const created = await api.request("create_session", { template: "buddy", cwd: api.dir, model_id: "fake-model", session_id: "invalid-command" });
+    const created = await api.request("create_session", { command: process.execPath, args: [fixture, flag], cwd: api.dir, model_id: "fake-model", session_id: "invalid-command" });
     expect(created.error.code).toBe("invalid_harness_command"); expect(created.status).toBe(400);
     expect((await api.request("ping")).data.sessions).toBe(0);
     const raw = readFileSync(join(api.config.paths.sessionDir, "invalid-command", "raw.jsonl"), "utf8");
@@ -200,9 +189,8 @@ describe("template HTTP API and create_session identity checks", () => {
   });
   it.each(["local", "remote"])("checks Docker commands in the %s target and cleans up on failure", async target => {
     const api = await app(); const log = join(api.dir, "docker.log"); vi.stubEnv("MOCK_DOCKER_LOG", log);
-    await api.request("register_template", { template: { ...docker, command: "/missing/in-container" } });
-    const created = await api.request("create_session", { template: "buddy", cwd: api.dir, model_id: "fake-model", target,
-      ...(target === "remote" ? { remote_host: "mock-host" } : {}) });
+    const created = await api.request("create_session", { command: "/missing/in-container", cwd: "/workspace", model_id: "fake-model",
+      runtime: "docker", docker_image: "mock/image:1", target, ...(target === "remote" ? { remote_host: "mock-host" } : {}) });
     expect(created.error.code, JSON.stringify(created)).toBe("command_not_found");
     const entries = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line).argv);
     expect(entries.some(argv => argv[0] === "run")).toBe(true);
@@ -210,21 +198,58 @@ describe("template HTTP API and create_session identity checks", () => {
     expect(entries.some(argv => argv[0] === "rm")).toBe(true);
     expect((await api.request("ping")).data.sessions).toBe(0);
   });
-  it("uses template PATH inside Docker and carries login mounts/environment into the launch", async () => {
+  it("uses the direct PATH inside Docker and merges login_dirs/mounts and env into the launch", async () => {
     const api = await app(); const executable = join(api.dir, "codebuddy");
     writeFileSync(executable, `#!/bin/sh\nexec ${shellJoin([process.execPath, fixture])} "$@"\n`, { mode: 0o700 });
     const log = join(api.dir, "docker.log"); vi.stubEnv("MOCK_DOCKER_LOG", log);
-    await api.request("register_template", { template: { ...docker, command: null, cwd: api.dir,
-      env: { PATH: api.dir, API_KEY: "private-template-sentinel" },
-      login_dirs: [{ source: api.dir, target: "/credentials" }] } });
-    const created = await api.request("create_session", { template: "buddy", model_id: "fake-model" });
+    const created = await api.request("create_session", { command: null, cwd: api.dir, model_id: "fake-model",
+      runtime: "docker", docker_image: "mock/image:1",
+      env: { PATH: api.dir, API_KEY: "private-sentinel" },
+      login_dirs: [{ source: api.dir, target: "/credentials" }],
+      mounts: [{ source: api.dir, target: "/workspace" }] });
     expect(created.ok, JSON.stringify(created)).toBe(true);
     await api.request("close_session", { session_id: created.data.session_id });
     const entries = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line).argv);
-    expect(entries.find(argv => argv[0] === "run")).toContain(`type=bind,src=${api.dir},dst=/credentials`);
-    expect(entries.some(argv => argv[0] === "exec" && argv.includes(`PATH=${api.dir}`) && argv.includes(executable))).toBe(true);
+    const run = entries.find(argv => argv[0] === "run")!;
+    expect(run).toContain(`type=bind,src=${api.dir},dst=/credentials`);
+    expect(run).toContain(`type=bind,src=${api.dir},dst=/workspace`);
+    expect(entries.some(argv => argv[0] === "exec" && argv.includes(`PATH=${api.dir}`) && argv.includes("codebuddy"))).toBe(true);
     const snapshot = readFileSync(join(api.config.paths.sessionDir, created.data.session_id, "session.json"), "utf8");
-    expect(snapshot).not.toContain("private-template-sentinel");
+    expect(snapshot).not.toContain("private-sentinel");
+  });
+  it("rejects a NUL-bearing cwd/mount/image as invalid_param before any launch or state write", async () => {
+    const api = await app(); const log = join(api.dir, "docker.log"); vi.stubEnv("MOCK_DOCKER_LOG", log);
+    // Bad cwd (direct): rejected at normalization, no process spawned.
+    const badCwd = await api.request("create_session", { ...launch, cwd: `${api.dir}\0bad`, model_id: "fake-model" });
+    expect(badCwd.status).toBe(400); expect(badCwd.error.code).toBe("invalid_param");
+    // Bad mount source (docker new): rejected before `docker run`.
+    const badMount = await api.request("create_session", { command: null, cwd: "/workspace", model_id: "fake-model",
+      runtime: "docker", docker_image: "mock/image:1", mounts: [{ source: "/src\0bad", target: "/workspace" }] });
+    expect(badMount.error.code).toBe("invalid_param");
+    // Bad login dir / image reference: rejected.
+    const badLogin = await api.request("create_session", { command: null, cwd: "/workspace", model_id: "fake-model",
+      runtime: "docker", docker_image: "mock/image:1", login_dirs: [{ source: "/creds\0bad", target: "/creds" }] });
+    expect(badLogin.error.code).toBe("invalid_param");
+    const badImage = await api.request("create_session", { command: null, cwd: "/workspace", model_id: "fake-model",
+      runtime: "docker", docker_image: "img\0bad" });
+    expect(badImage.error.code).toBe("invalid_param");
+    // Nothing was created or spawned.
+    expect((await api.request("ping")).data.sessions).toBe(0);
+    expect(existsSync(log)).toBe(false);
+  });
+  it("rejects a managed flag for the resolved default harness as invalid_param without a session", async () => {
+    const api = await app();
+    const rejected = await api.request("create_session", { cwd: api.dir, model_id: "fake-model", args: ["--acp"] });
+    expect(rejected.status).toBe(400); expect(rejected.error.code).toBe("invalid_param");
+    expect((await api.request("ping")).data.sessions).toBe(0);
+  });
+  it("treats an empty command as the built-in PATH executable", async () => {
+    const api = await app(); const executable = join(api.dir, "codebuddy");
+    writeFileSync(executable, `#!/bin/sh\nexec ${shellJoin([process.execPath, fixture])} "$@"\n`, { mode: 0o700 });
+    vi.stubEnv("PATH", api.dir);
+    const created = await api.request("create_session", { command: "", cwd: api.dir, model_id: "fake-model" });
+    expect(created.ok, JSON.stringify(created)).toBe(true);
+    await api.request("close_session", { session_id: created.data.session_id });
   });
   it("rejects obsolete YAML command configuration", async () => {
     const dir = directory(); const path = join(dir, "config.yaml");

@@ -23,17 +23,16 @@ async function setup(settings: Record<string, unknown> = {}, flags: string[] = [
   const address = await server.start();
   cleanup.push(async () => { await server.stop(); rmSync(directory, { recursive: true, force: true }); });
   const base = `http://127.0.0.1:${address.port}`;
+  // create_session no longer references a template: the launch executable/argv are passed directly.
+  const launchArgs = [fixture, `--fake-agent=${harness}`, ...flags];
   const request = async (method: string, params: Record<string, unknown> = {}) => {
-    const response = await fetch(`${base}/api/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(method === "create_session" ? { template: params.runtime === "docker" ? "fixture-docker" : "fixture", ...params } : params) });
+    const body = method === "create_session"
+      ? { command: process.execPath, args: launchArgs, runtime: params.runtime === "docker" ? "docker" : "direct",
+        ...(params.runtime === "docker" ? { docker_image: "mock/image:1" } : {}), ...params }
+      : params;
+    const response = await fetch(`${base}/api/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     return { status: response.status, ...(await response.json() as any) };
   };
-  for (const runtime of ["direct", "docker"]) {
-    await server.service.dispatch("register_template", { template: {
-      name: runtime === "docker" ? "fixture-docker" : "fixture", harness, runtime,
-      command: process.execPath, args: [fixture, `--fake-agent=${harness}`, ...flags],
-      ...(runtime === "docker" ? { docker_image: "mock/image:1" } : {}),
-    } });
-  }
   const create = async () => {
     const response = await request("create_session", { cwd: directory, model_id: "fake-model" });
     expect(response.ok, JSON.stringify(response)).toBe(true); return response.data.session_id as string;
@@ -83,7 +82,7 @@ async function nextAuthQuestion(request: (method: string, params?: Record<string
 describe("HTTP server contract and session state machine", () => {
   it("accepts only POST JSON and searches configuration without starting a harness", async () => {
     const app = await setup();
-    const ping = await app.request("ping"); expect(ping.data.sessions).toBe(0); expect(ping.data.protocol_version).toBe(3);
+    const ping = await app.request("ping"); expect(ping.data.sessions).toBe(0); expect(ping.data.protocol_version).toBe(4);
     const found = await app.request("search_harness"); expect(found.data.harnesses.codebuddy.models[0].id).toBe("fake-model");
     expect((await app.request("ping")).data.sessions).toBe(0);
     expect((await fetch(`${app.base}/api/ping`)).status).toBe(405);
