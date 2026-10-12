@@ -24,10 +24,9 @@
  * supervisor notices and cleans up on its own.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { realpathSync } from "node:fs";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
 
+import { isEntryPoint } from "../io/entry.js";
 import { writeAtomicFileSync } from "../io/persistence.js";
 import {
   SUPERVISOR_SPEC_ENV,
@@ -300,16 +299,6 @@ function waitForHarness(child: ChildProcess): Promise<number> {
   });
 }
 
-function isEntryPoint(): boolean {
-  const entry = process.argv[1];
-  if (!entry) return false;
-  try {
-    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
-  } catch {
-    return false;
-  }
-}
-
 async function main(): Promise<void> {
   let spec: SupervisorSpec;
   try {
@@ -322,4 +311,4 @@ async function main(): Promise<void> {
   await run(spec);
 }
 
-if (isEntryPoint()) void main();
+if (isEntryPoint(import.meta.url)) void main();

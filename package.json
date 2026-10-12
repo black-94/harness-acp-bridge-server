@@ -38,6 +38,10 @@
     "README.md",
     "LICENSE"
   ],
+  "bin": {
+    "hacpd": "./dist/main.js",
+    "hacpr": "./dist/io/reader.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist",
@@ -47,7 +51,7 @@
     "check": "npm run clean && npm run build && npm run typecheck && npm test",
     "prepack": "npm run clean && npm run build",
     "prepublishOnly": "npm run check",
-    "start": "node dist/hacp.js"
+    "start": "node dist/main.js"
   },
   "dependencies": {
     "yaml": "^2.6.1",

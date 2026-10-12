@@ -21,9 +21,18 @@ describe("npm release metadata", () => {
     expect(CLIENT_VERSION).toBe(manifest.version);
   });
 
-  it("publishes only server entrypoints, without CLI executables or an MCP dependency", () => {
-    expect(manifest.bin).toBeUndefined();
+  it("publishes the library entrypoint, the hacpd/hacpr commands, and no MCP dependency", () => {
+    expect(manifest.bin).toEqual({ hacpd: "./dist/main.js", hacpr: "./dist/io/reader.js" });
     expect(manifest.exports).toEqual({ ".": "./dist/index.js" });
     expect(manifest.dependencies["@modelcontextprotocol/sdk"]).toBeUndefined();
+  });
+
+  it("ships every command target in the published tarball", () => {
+    const targets = Object.values(manifest.bin as Record<string, string>);
+    expect(targets.length).toBeGreaterThan(0);
+    for (const target of targets) {
+      const relative = target.replace(/^\.\//, "");
+      expect(manifest.files.some((entry: string) => relative === entry || relative.startsWith(`${entry}/`))).toBe(true);
+    }
   });
 });

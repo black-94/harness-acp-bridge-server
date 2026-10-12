@@ -13,13 +13,37 @@ npm run build
 HARNESS_ACP_BRIDGE_CONFIG=./config.example.yaml npm start
 ```
 
-The service entrypoint is `dist/hacp.js`; the package has no CLI executables or MCP
-server. Configuration is resolved from `HARNESS_ACP_BRIDGE_CONFIG`, the XDG/default
-config location, then built-in defaults. All settings use schema version 2; unknown
-fields and older schema versions are rejected. Defaults bind `127.0.0.1:8787`.
+The daemon entrypoint is `dist/main.js`, installed as the `hacpd` command; configuration is
+resolved from `HARNESS_ACP_BRIDGE_CONFIG`, the XDG/default config location, then built-in
+defaults. All settings use schema version 2; unknown fields and older schema versions are
+rejected. Defaults bind `127.0.0.1:8787`.
 
 For embedding, import `HarnessHttpServer` and `loadConfig` from the package, call
 `start()`, and call `stop()` to close the listener and its sessions.
+
+## Commands
+
+Installing the package globally links two commands:
+
+| Command | Entry | Purpose |
+| --- | --- | --- |
+| `hacpd` | `dist/main.js` | The daemon: reads configuration and serves the HTTP API. |
+| `hacpr` | `dist/io/reader.js` | Streams a session's rendered output from its `raw.jsonl` journal. |
+
+```sh
+hacpd                                  # start the daemon (identical to npm start)
+hacpr                                  # follow the most recent session
+hacpr 2026-10-12-ab12cd34ef56          # follow a session by id
+hacpr --once -J > events.jsonl         # dump what is on disk now as JSONL
+hacpr -m msg_8f3c... -e                # only new events of one message
+```
+
+`hacpr` follows the journal until interrupted. `--once` emits what is already on disk and
+exits, `-e/--from-end` skips the existing content, `-J/--json` writes one JSON event per line,
+and `-m/--message` restricts output to a single `message_id`. In the text view the
+`answer`/`reasoning`/`user` increments are written verbatim (safe to splice into a pipeline),
+`stderr` goes to stderr, and structured events (`tool_call`, `lifecycle`, …) are prefixed with
+`[type]`.
 
 ## Layers and layout
 
@@ -33,7 +57,7 @@ implementation lives in focused directories:
 | `adapter/` | `adapters.ts` per-harness argv, permission modes, and auth probing |
 | `logic/` | `service.ts`/`session.ts` operations and state, plus `config.ts`, `auth.ts`, `create-params.ts`, `errors.ts` |
 | `redact/` | `redact.ts`/`redact-core.ts` on-disk masking and `privacy.ts` account whitelist |
-| `io/` | `persistence.ts` journal/snapshots, `runtime.ts` launch I/O, `preview.ts` cursor paging |
+| `io/` | `persistence.ts` journal/snapshots, `runtime.ts` launch I/O, `reader.ts` cursor paging + `hacpr`, `entry.ts` entrypoint detection |
 | `http/` | `server.ts` routing and JSON envelopes |
 
 ```text
@@ -62,9 +86,9 @@ Main agent --HTTP POST--> http/server.ts --> logic/service.ts + logic/session.ts
    decides whether to cancel a message or terminate its harness after an error.
 4. **HTTP** validates JSON requests, routes the operations, and returns JSON envelopes,
    including client disconnects. There is no SSE stream.
-5. **Preview** (`io/preview.ts`) is an internal, cursorable reader over `raw.jsonl`; it is
-   not exposed over HTTP. Callers observe progress through `message_status`. It has no
-   preview file and retains no rolling text window.
+5. **Preview** (`io/reader.ts`) is an internal, cursorable reader over `raw.jsonl`; it is not
+   exposed over HTTP (the `hacpr` command drives it from a terminal). Callers observe progress
+   through `message_status`. It has no preview file and retains no rolling text window.
 
 The supervisor owns the local harness process group and SSH/Docker cleanup. Server
 shutdown or loss of its parent/stdio triggers cleanup. One server owns a session directory;

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionStore } from "../src/io/persistence";
 import { StdioTransport } from "../src/transport/stdio";
-import { readPreview } from "../src/io/preview";
+import { readPreview } from "../src/io/reader";
 import { decodeLine } from "../src/acp/protocol";
 
 const dirs: string[] = [];
