@@ -47,7 +47,7 @@ and `-m/--message` restricts output to a single `message_id`. In the text view t
 
 ## Layers and layout
 
-`src/` keeps only the exported `index.ts` and the `hacp.ts` command entrypoint; the
+`src/` keeps only the exported `index.ts` and the `main.ts` daemon entrypoint (`hacpd`); the
 implementation lives in focused directories:
 
 | Directory | Contents |
