@@ -171,14 +171,27 @@ export class ProtocolAdapter extends EventEmitter {
         return;
       }
       const result = frame.result;
+      // ACP session-setup: `session/new` creates a session and MUST return its id, but `session/load`
+      // restores the session the caller named and its response may be void (`{}`) or carry only
+      // metadata (models/modes/configOptions) — it is NOT required to echo an id. The requested id is
+      // authoritative, so a load can never be made ready without a valid one.
+      const requestedLoadId = pending.method === "session/load" && typeof pending.params.sessionId === "string" && pending.params.sessionId.length > 0
+        ? pending.params.sessionId : null;
+      // An older harness may echo the id it was asked to load; accept it only when it matches, so a
+      // response can never silently swap the restored session for a different one.
+      const echoedLoadId = pending.method === "session/load" && isRecord(result) ? result.sessionId : undefined;
+      const loadIdConflict = pending.method === "session/load" && echoedLoadId !== undefined &&
+        (typeof echoedLoadId !== "string" || echoedLoadId !== requestedLoadId);
       if (frame.jsonrpc !== "2.0" || !isRecord(result) || (pending.method === "initialize" && result.protocolVersion !== 1) ||
-          (["session/new", "session/load"].includes(pending.method) && typeof result.sessionId !== "string") ||
+          (pending.method === "session/new" && typeof result.sessionId !== "string") ||
+          (pending.method === "session/load" && (requestedLoadId === null || loadIdConflict)) ||
           (pending.method === "session/prompt" && typeof result.stopReason !== "string")) {
         pending.reject(new BridgeError("unsupported_response", `unsupported response to ${pending.method}`, { raw: raw.toString("utf8") }));
         return;
       }
       if (pending.method === "initialize") this.initializeResponse = frame;
-      if (["session/new", "session/load"].includes(pending.method)) this.sessionId = result.sessionId;
+      if (pending.method === "session/new") this.sessionId = result.sessionId;
+      if (pending.method === "session/load") this.sessionId = requestedLoadId;
       if (pending.method === "session/set_model" || (pending.method === "session/set_config_option" && pending.params.configId === "model")) {
         this.options = null; this.reasoningEffort = null;
         this.modelId = String(pending.params.modelId ?? pending.params.value);

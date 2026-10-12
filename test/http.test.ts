@@ -539,6 +539,32 @@ describe("HTTP server contract and session state machine", () => {
     const message = (await app.request("send_message", { session_id: session, text: "still-live" })).data.message_id;
     expect((await app.complete(session, message)).state).toBe("completed");
   });
+  it("resumes a closed session through session/load and prompts with the requested id", async () => {
+    const app = await setup();
+    // A fresh harness session created via session/new, used once, then closed.
+    const created = await app.create();
+    const first = (await app.request("send_message", { session_id: created, text: "before-close" })).data.message_id;
+    expect((await app.complete(created, first)).result.text).toBe("echo:before-close");
+    await app.request("close_session", { session_id: created });
+
+    // Resuming a harness session id opens a NEW bridge session through session/load, whose canonical
+    // void response carries no id: the requested id must become the protocol session id.
+    const harnessId = "01a12f50-resume-abc";
+    const resumed = await app.createRaw({ resume_session_id: harnessId });
+    expect(resumed.ok, JSON.stringify(resumed)).toBe(true);
+    const session = resumed.data.session_id as string;
+    expect(resumed.data.harness_session_id).toBe(harnessId);
+
+    // The resumed session is usable and the prompt carries the ORIGINAL harness id on the wire.
+    const second = (await app.request("send_message", { session_id: session, text: "after-resume" })).data.message_id;
+    expect((await app.complete(session, second)).result.text).toBe("echo:after-resume");
+
+    const frames = readFileSync(join(app.config.paths.sessionDir, session, "raw.jsonl"), "utf8").trim().split("\n")
+      .map(line => JSON.parse(line)).filter(event => event.stream === "stdin")
+      .map(event => JSON.parse(Buffer.from(event.raw, "base64").toString("utf8")) as Record<string, any>);
+    expect(frames.find(frame => frame.method === "session/load")?.params.sessionId).toBe(harnessId);
+    expect(frames.find(frame => frame.method === "session/prompt")?.params.sessionId).toBe(harnessId);
+  });
   it.each([{ target: "local", runtime: "docker" }, { target: "remote", runtime: "direct" }, { target: "remote", runtime: "docker" }])("exercises supervisor launch and cleanup via local shims: $target/$runtime", async launch => {
     const docker = fileURLToPath(new URL("./fixtures/mock-docker.mjs", import.meta.url));
     const ssh = fileURLToPath(new URL("./fixtures/mock-ssh.mjs", import.meta.url));

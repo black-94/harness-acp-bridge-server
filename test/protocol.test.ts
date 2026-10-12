@@ -127,3 +127,83 @@ describe("ProtocolAdapter reverse requests", () => {
     expect(transport.written.at(-1)).toEqual({ jsonrpc: "2.0", id: 41, result: { action: "accept" } });
   });
 });
+
+/**
+ * ACP session-setup response separation. `session/new` creates a session and MUST return its id;
+ * `session/load` restores the caller-named session and may answer `{}` (or metadata without an id).
+ * The requested id — never the response — is the restored protocol session id, so a load can never
+ * be reported ready without a valid request id.
+ */
+describe("ProtocolAdapter session/new vs session/load responses", () => {
+  function respond(method: string, params: Record<string, unknown>, frame: (id: unknown) => Record<string, unknown>) {
+    const { protocol, transport } = adapter();
+    const ticket = protocol.beginRequest(method, params);
+    const id = transport.written.at(-1)!.id;
+    transport.emit("line", Buffer.from(JSON.stringify(frame(id))));
+    return { protocol, transport, ticket };
+  }
+  const loadParams = (sessionId?: unknown) => ({ cwd: "/tmp", mcpServers: [], ...(sessionId === undefined ? {} : { sessionId }) });
+
+  it("requires a returned id from session/new", async () => {
+    const ok = respond("session/new", { cwd: "/tmp", mcpServers: [] }, id => ({ jsonrpc: "2.0", id, result: { sessionId: "fresh-1" } }));
+    await expect(ok.ticket.promise).resolves.toBeDefined();
+    expect(ok.protocol.sessionId).toBe("fresh-1");
+
+    const missing = respond("session/new", { cwd: "/tmp", mcpServers: [] }, id => ({ jsonrpc: "2.0", id, result: {} }));
+    await expect(missing.ticket.promise).rejects.toMatchObject({ code: "unsupported_response" });
+    expect(missing.protocol.sessionId).toBeNull();
+  });
+
+  it("accepts a void {} response from session/load and keeps the requested id", async () => {
+    const { protocol, ticket } = respond("session/load", loadParams("sess-void"), id => ({ jsonrpc: "2.0", id, result: {} }));
+    await expect(ticket.promise).resolves.toMatchObject({ result: {} });
+    expect(protocol.sessionId).toBe("sess-void");
+  });
+
+  it("accepts real load metadata without an id and keeps options/model readback", async () => {
+    const { protocol, ticket } = respond("session/load", loadParams("sess-meta"), id => ({ jsonrpc: "2.0", id,
+      result: { models: { currentModelId: "fake-model-2" }, configOptions: [
+        { id: "model", currentValue: "fake-model-2" },
+        { id: "reasoning_effort", currentValue: "high" },
+      ] } }));
+    await expect(ticket.promise).resolves.toBeDefined();
+    expect(protocol.sessionId).toBe("sess-meta");
+    expect(protocol.modelId).toBe("fake-model-2");
+    expect(protocol.reasoningEffort).toBe("high");
+    expect(protocol.options).toEqual([{ id: "model", currentValue: "fake-model-2" }, { id: "reasoning_effort", currentValue: "high" }]);
+  });
+
+  it.each([undefined, ""])("never becomes ready when the load request id is %s", async sessionId => {
+    const { protocol, ticket } = respond("session/load", loadParams(sessionId), id => ({ jsonrpc: "2.0", id, result: {} }));
+    await expect(ticket.promise).rejects.toMatchObject({ code: "unsupported_response" });
+    expect(protocol.sessionId).toBeNull();
+  });
+
+  it("carries the original requested id into a subsequent request", async () => {
+    const { protocol, transport, ticket } = respond("session/load", loadParams("sess-next"), id => ({ jsonrpc: "2.0", id, result: {} }));
+    await ticket.promise;
+    protocol.beginRequest("session/prompt", { sessionId: protocol.sessionId, prompt: [{ type: "text", text: "hi" }] });
+    expect(protocol.sessionId).toBe("sess-next");
+    expect(transport.written.at(-1)).toMatchObject({ method: "session/prompt", params: { sessionId: "sess-next" } });
+  });
+
+  it("accepts a legacy echoed id only when it matches the request, and rejects a conflict", async () => {
+    const match = respond("session/load", loadParams("sess-echo"), id => ({ jsonrpc: "2.0", id, result: { sessionId: "sess-echo" } }));
+    await expect(match.ticket.promise).resolves.toBeDefined();
+    expect(match.protocol.sessionId).toBe("sess-echo");
+
+    const conflict = respond("session/load", loadParams("sess-wanted"), id => ({ jsonrpc: "2.0", id, result: { sessionId: "sess-other" } }));
+    await expect(conflict.ticket.promise).rejects.toMatchObject({ code: "unsupported_response" });
+    expect(conflict.protocol.sessionId).toBeNull();
+  });
+
+  it("still rejects malformed results and RPC errors for session/load", async () => {
+    const nonObject = respond("session/load", loadParams("s1"), id => ({ jsonrpc: "2.0", id, result: "nope" }));
+    await expect(nonObject.ticket.promise).rejects.toMatchObject({ code: "unsupported_response" });
+    const badEnvelope = respond("session/load", loadParams("s2"), id => ({ jsonrpc: "1.0", id, result: {} }));
+    await expect(badEnvelope.ticket.promise).rejects.toMatchObject({ code: "unsupported_response" });
+    const error = respond("session/load", loadParams("s3"), id => ({ jsonrpc: "2.0", id, error: { code: -32000, message: "boom" } }));
+    await expect(error.ticket.promise).rejects.toMatchObject({ code: -32000 });
+    expect(error.protocol.sessionId).toBeNull();
+  });
+});

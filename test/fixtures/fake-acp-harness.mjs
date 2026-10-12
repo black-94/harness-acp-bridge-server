@@ -444,6 +444,8 @@ function handle(message) {
       : [{ id: "api-key", name: "API key" }];
     reply(message.id, {
       protocolVersion: 1,
+      // A real loadSession-capable harness advertises the capability the bridge restores against.
+      agentCapabilities: { loadSession: true },
       authMethods,
       models: { currentModelId: model, availableModels: AVAILABLE_MODELS },
     });
@@ -507,8 +509,10 @@ function handle(message) {
     return;
   }
   if (message.method === "session/load") {
+    // ACP `session/load` adopts the requested session and answers with a canonical, id-less result
+    // (`{}`). The bridge must take the restored id from its own request, not this response.
     sessionId = message.params?.sessionId ?? sessionId;
-    reply(message.id, { sessionId });
+    reply(message.id, {});
     return;
   }
   if (message.method === "session/set_model") {
