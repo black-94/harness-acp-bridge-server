@@ -132,10 +132,18 @@ describe("template validation and durable registry", () => {
     const dir = directory(); writeFileSync(join(dir, "templates.json"), "not JSON");
     expect(() => new TemplateRegistry(dir)).toThrow(expect.objectContaining({ code: "storage_error" }));
   });
-  it("rejects missing or mismatched ACP harness identities", () => {
-    expect(() => assertHarnessIdentity("codebuddy", { result: { agentInfo: { name: "CodeBuddy" } } })).not.toThrow();
-    for (const name of ["codex-acp", "fake-codebuddy", undefined]) {
-      expect(() => assertHarnessIdentity("codebuddy", { result: { agentInfo: { name } } })).toThrow(expect.objectContaining({ code: "invalid_harness_command" }));
+  it.each(["codebuddy", "codex", "agy"])("accepts omitted/null ACP v1 agentInfo for %s", harness => {
+    expect(() => assertHarnessIdentity(harness, { result: { protocolVersion: 1 } })).not.toThrow();
+    expect(() => assertHarnessIdentity(harness, { result: { protocolVersion: 1, agentInfo: null } })).not.toThrow();
+  });
+  it.each([
+    ["codebuddy", "CodeBuddy", "codex-acp"],
+    ["codex", "Codex-ACP", "codebuddy"],
+    ["agy", "Antigravity", "codex"],
+  ])("validates supplied ACP harness identity for %s", (harness, validName, wrongName) => {
+    expect(() => assertHarnessIdentity(harness, { result: { agentInfo: { name: validName } } })).not.toThrow();
+    for (const agentInfo of [{ name: wrongName }, { name: "fake-codebuddy" }, {}, { name: "" }, { name: " " }, { name: 123 }, "invalid", false, []]) {
+      expect(() => assertHarnessIdentity(harness, { result: { agentInfo } })).toThrow(expect.objectContaining({ code: "invalid_harness_command" }));
     }
   });
 });
@@ -285,7 +293,27 @@ describe("template HTTP API and decoupled create_session", () => {
     vi.stubEnv("PATH", "/does-not-exist");
     expect((await api.request("create_session", { cwd: api.dir, model_id: "fake-model" })).error.code).toBe("command_not_found");
   });
-  it.each(["--fake-agent=codex-acp", "--no-agent-info", "--initialize-auth-required"])("rejects an executable with invalid identity (%s) before session/new", async flag => {
+  it.each(["codebuddy", "codex", "agy"].flatMap(harness => ["--no-agent-info", "--null-agent-info"].map(flag => ({ harness, flag }))))(
+    "creates and uses a $harness session with $flag", async ({ harness, flag }) => {
+      const api = await app();
+      const created = await api.request("create_session", { harness, command: process.execPath, args: [fixture, flag], cwd: api.dir, model_id: "fake-model" });
+      expect(created.status, JSON.stringify(created)).toBe(200);
+      expect(created.data).toMatchObject({ state: "ready", harness, harness_session_id: "fake-1" });
+      expect((await api.request("send_message", { session_id: created.data.session_id, text: "without identity metadata" })).ok).toBe(true);
+      expect((await api.request("close_session", { session_id: created.data.session_id })).ok).toBe(true);
+      expect((await api.request("ping")).data.sessions).toBe(0);
+    });
+  it.each(["--no-agent-info", "--null-agent-info"])("preserves authentication-required setup with %s", async flag => {
+    const api = await app();
+    const created = await api.request("create_session", { command: process.execPath, args: [fixture, flag, "--auth-required"], cwd: api.dir, model_id: "fake-model" });
+    expect(created.status, JSON.stringify(created)).toBe(403);
+    expect(created.error.code).toBe("authentication_required");
+    const session = created.error.detail.session_id;
+    expect(created.error.detail.next_action).toEqual({ method: "authenticate", params: { session_id: session } });
+    expect((await api.request("ping")).data.sessions).toBe(1);
+    expect((await api.request("close_session", { session_id: session })).ok).toBe(true);
+  });
+  it.each(["--fake-agent=codex-acp", "--initialize-auth-required"])("rejects an executable with invalid identity (%s) before session/new", async flag => {
     const api = await app();
     const created = await api.request("create_session", { command: process.execPath, args: [fixture, flag], cwd: api.dir, model_id: "fake-model", session_id: "invalid-command" });
     expect(created.error.code).toBe("invalid_harness_command"); expect(created.status).toBe(400);

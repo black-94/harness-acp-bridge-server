@@ -466,7 +466,8 @@ function handle(message) {
       : [{ id: "api-key", name: "API key" }];
     reply(message.id, {
       protocolVersion: 1,
-      ...(!FLAGS.has("--no-agent-info") ? { agentInfo: { name: process.argv.find(arg => arg.startsWith("--fake-agent="))?.split("=")[1] ?? "codebuddy", version: "test" } } : {}),
+      ...(FLAGS.has("--null-agent-info") ? { agentInfo: null } : !FLAGS.has("--no-agent-info")
+        ? { agentInfo: { name: process.argv.find(arg => arg.startsWith("--fake-agent="))?.split("=")[1] ?? "codebuddy", version: "test" } } : {}),
       // A real loadSession-capable harness advertises the capability the bridge restores against.
       agentCapabilities: { loadSession: true },
       authMethods,

@@ -65,7 +65,10 @@ const AGENT_NAMES: Readonly<Record<string, readonly string[]>> = {
 };
 export function assertHarnessIdentity(harness: string, response: Record<string, unknown>): void {
   const result = response.result as Record<string, unknown> | undefined;
-  const agent = result?.agentInfo as Record<string, unknown> | undefined;
+  const agent = result?.agentInfo as Record<string, unknown> | null | undefined;
+  // ACP v1 makes agentInfo optional and nullable. Absence means unknown identity, not a
+  // mismatched executable; validate the name only when the agent supplies this metadata.
+  if (agent === undefined || agent === null) return;
   const name = typeof agent?.name === "string" ? agent.name.trim().toLowerCase() : null;
   if (!name || !AGENT_NAMES[harness]?.includes(name)) {
     throw new BridgeError("invalid_harness_command", `command does not identify as the selected harness ${harness}`, {

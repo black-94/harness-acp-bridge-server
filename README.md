@@ -125,8 +125,8 @@ Authentication here is the child harness's login, not HTTP client authentication
 `login_dirs`; the remaining launch plumbing — the SSH program and its arguments, `docker_command`,
 state/session/metadata paths, and buffer bounds — stays server-owned and is rejected as
 `launch_internal`. The trust boundary therefore lets a caller choose which executable launches, but
-it is not a guarantee that an arbitrary binary is safe: the ACP identity handshake still verifies
-the process really is the selected harness. Template APIs are administrative: this server has no
+it is not a guarantee that an arbitrary binary is safe: the ACP handshake checks protocol
+compatibility and validates the selected harness name when the process supplies `agentInfo`. Template APIs are administrative: this server has no
 HTTP authorization layer; keep it on a trusted/loopback interface and do not expose registration to
 untrusted callers.
 
@@ -271,11 +271,13 @@ Missing/non-executable commands return `command_not_found` (404); an invalid exp
 never falls back to another executable. Container preparation is needed before its check.
 
 Before opening an ACP session or probing authentication, `create_session` performs ACP
-`initialize` and verifies `agentInfo.name` matches the selected harness (case-insensitive exact
-known names: CodeBuddy `codebuddy`/`codebuddy-code`, Codex `codex`/`codex-acp`, Agy
-`agy`/`agy-acp-server`/`agy_acp_server`/`antigravity`). Missing/mismatched identity returns
-`invalid_harness_command` (400), never sends `session/new`/`session/load`, and closes the process
-and cleans up resources according to container policy. Failed creation may retain a bridge
+`initialize` with ACP v1. Its optional `agentInfo` may be omitted or `null` for any harness;
+this means the identity is unknown and does not block session creation or authentication.
+When `agentInfo` is supplied, `agentInfo.name` must match the selected harness (case-insensitive
+exact known names: CodeBuddy `codebuddy`/`codebuddy-code`, Codex `codex`/`codex-acp`, Agy
+`agy`/`agy-acp-server`/`agy_acp_server`/`antigravity`). A malformed or mismatched supplied identity
+returns `invalid_harness_command` (400), never sends `session/new`/`session/load`, and closes the
+process and cleans up resources according to container policy. Failed creation may retain a bridge
 failure journal, but no usable ACP session. A non-ACP program or a hung handshake is rejected by
 the normal protocol/startup validation and deadline. Identity is protocol compatibility validation,
 not a cryptographic guarantee against a malicious command spoofing its own name.

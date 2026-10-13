@@ -6,7 +6,7 @@
  * plus Docker-only `login_dirs`). The remaining launch plumbing is still server-owned and rejected:
  * the SSH program and its arguments, state/session/metadata paths, buffer bounds, and the Docker
  * control program. A caller-supplied `command` is trusted to be *some* executable, but the ACP
- * identity handshake still verifies it really is the selected harness.
+ * handshake checks protocol compatibility and validates supplied harness identity metadata.
  */
 import { assertLaunchArgs, isBuiltinHarness, type ContainerPolicy, type PermissionMode, type Runtime } from "../adapter/adapters.js";
 import type { DockerMountSpec, DockerPortSpec } from "../io/runtime.js";
