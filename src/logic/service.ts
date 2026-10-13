@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { AuthCoordinator, AuthLedger } from "./auth.js";
 import { assertLaunchArgs } from "../adapter/adapters.js";
-import { harnessInfo, resolveHarness, type BridgeConfig } from "./config.js";
+import { resolveHarness, type BridgeConfig } from "./config.js";
 import { assertAllowedKeys, normalizeCreateParams } from "./create-params.js";
 import { authenticationRequired, BridgeError, isRecord } from "./errors.js";
 import { isValidSessionId, newSessionId, QUEUE_FILE, RAW_FILE, readJsonFileSafe, RESULTS_DIR, SESSION_FILE, sessionDirectory, writeJsonAtomicSync } from "../io/persistence.js";
@@ -12,7 +12,7 @@ import { Redactor, collectSecrets } from "../redact/redact.js";
 import { HarnessSession } from "./session.js";
 import { TemplateRegistry } from "./templates.js";
 
-export const METHODS = ["ping", "search_harness", "register_template", "delete_template", "search_template", "create_session", "close_session", "authenticate", "auth_status", "set_session_options", "send_message", "cancel_message", "message_status", "answer_question"] as const;
+export const METHODS = ["ping", "register_template", "delete_template", "search_template", "create_session", "close_session", "authenticate", "auth_status", "set_session_options", "send_message", "cancel_message", "message_status", "answer_question"] as const;
 /** Bumped when the public HTTP contract changes incompatibly (`create_session` no longer references a template). */
 export const PROTOCOL_VERSION = 4;
 export interface RequestContext { signal?: AbortSignal }
@@ -113,9 +113,6 @@ export class HarnessService {
         return { status: "ok", protocol_version: PROTOCOL_VERSION, pid: process.pid, started_at: new Date(this.startedAt).toISOString(),
           uptime_seconds: (Date.now() - this.startedAt) / 1000, sessions: [...this.sessions.values()].filter(session => !session.isClosed).length,
           config_fingerprint: this.config.fingerprint };
-      case "search_harness":
-        assertAllowedKeys(params, ["harness"]);
-        return { harnesses: harnessInfo(this.config, string(params, "harness", true)) };
       case "register_template": {
         assertAllowedKeys(params, ["template"]);
         return { template: this.templates.register(params.template) };
@@ -139,7 +136,7 @@ export class HarnessService {
         // adapter's internal error. This reuses `assertLaunchArgs` — it does not copy the flag table
         // and does not reclassify unrelated adapter errors.
         try {
-          assertLaunchArgs(resolveHarness(this.config, options.harness).name, options.args);
+          assertLaunchArgs(resolveHarness(this.config, options.harness), options.args);
         } catch (error) {
           throw new BridgeError("invalid_param", error instanceof Error ? error.message : String(error));
         }

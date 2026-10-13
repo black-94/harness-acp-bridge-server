@@ -1,0 +1,24 @@
+{
+  "name": "codex-docker-proxy",
+  "description": "Codex in Docker bridge mode via a generic proxy; replace image, paths and proxy_port before registration (8080 is illustrative, not a detected port)",
+  "harness": "codex",
+  "model": null,
+  "thinking": null,
+  "before_start": "Confirm the HTTP proxy port with the user. Verify host.docker.internal and that port are reachable from the Docker execution host's container network; do not change listener/firewall settings without approval.",
+  "after_start": "Complete required harness authentication, then verify proxy connectivity from the harness container before normal work. Report failures without silently switching network mode.",
+  "special_instructions": "The proxy may be Xray or any proxy service supported by the harness. Container loopback is not the host; verify the fixed host.docker.internal address is available. The server generates identical http_proxy/https_proxy plus a common-private-range no_proxy; use all three. Proxy env is not a Docker-daemon/image-pull or bridge-client proxy.",
+  "target": "local",
+  "runtime": "docker",
+  "command": null,
+  "args": [],
+  "env": {},
+  "permission_mode": "auto",
+  "cwd": "/workspace",
+  "docker_image": "your-codex-image:latest",
+  "mounts": [
+    { "source": "/absolute/host/project", "target": "/workspace", "read_only": false }
+  ],
+  "ports": [],
+  "network_mode": "proxy",
+  "proxy_port": 8080
+}

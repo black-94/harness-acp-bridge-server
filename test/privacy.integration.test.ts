@@ -82,7 +82,7 @@ async function setup(harnessEnv: Record<string, string>, extra: Record<string, u
     server: { host: "127.0.0.1", port: 0 }, sessions: { max_concurrency: 4, reap_interval_seconds: 0.05 },
     timeouts: { startup_timeout_seconds: 3, request_timeout_seconds: 1, turn_timeout_seconds: 5, turn_cancel_timeout_seconds: 0.3, terminate_grace_seconds: 0.05, remote_cleanup_timeout_seconds: 0.05, authentication_timeout_seconds: 0.5 },
     authentication: { rate_limit: { enabled: false } }, default_harness: "codebuddy",
-    harnesses: { codebuddy: { models: [{ id: "fake-model", thinking_levels: ["low", "high"] }] } }, ...extra }));
+    ...extra }));
   const config = loadConfig(path);
   const server = new HarnessHttpServer(config);
   const address = await server.start();

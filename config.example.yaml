@@ -56,21 +56,7 @@ authentication:
     max_attempts: 10
     window_seconds: 86400
 
-default_harness: codebuddy
-harnesses:
-  codebuddy:
-    models:
-      - id: claude-sonnet-4
-        name: Claude Sonnet 4
-        thinking_levels: [low, medium, high]
-      - id: gpt-5
-        name: GPT-5
-        # Omitted thinking_levels means unknown, not unsupported.
-  codex:
-    models:
-      - id: gpt-5-codex
-        name: GPT-5 Codex
-  agy:
-    models:
-      - id: gemini-2.5-pro
-        name: Gemini 2.5 Pro
+# All three built-in adapters are always available; no harnesses declaration is needed.
+# Templates / explicit session params select a harness, model, and thinking level.
+# Omitted/null uses Codex. A YAML file is optional when all defaults suffice.
+default_harness: codex

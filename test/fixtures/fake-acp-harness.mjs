@@ -63,7 +63,8 @@ if (EMIT_GARBAGE) process.stdout.write("this is not json\n");
 
 let buffer = "";
 let sessionId = "fake-1";
-let model = "fake-model";
+const modelArg = process.argv.indexOf("--model");
+let model = modelArg >= 0 ? process.argv[modelArg + 1] ?? "fake-model" : "fake-model";
 let permissionRequestId = 9000;
 let infoRequestId = 9100;
 let elicitRequestId = 9200;
@@ -86,6 +87,12 @@ const PROMPT_FILE = process.env.FAKE_HARNESS_PROMPT_FILE;
 const AUTH_FILE = process.env.FAKE_HARNESS_AUTH_FILE;
 /** Records the exact auth answer content the harness received (the original wire bytes). */
 const ANSWER_FILE = process.env.FAKE_HARNESS_ANSWER_FILE;
+/** Harness-side proof of proxy-env delivery; the shim does not connect to a live proxy. */
+if (process.env.FAKE_HARNESS_PROXY_FILE) {
+  writeFileSync(process.env.FAKE_HARNESS_PROXY_FILE, JSON.stringify({
+    http_proxy: process.env.http_proxy ?? "", https_proxy: process.env.https_proxy ?? "", no_proxy: process.env.no_proxy ?? "",
+  }));
+}
 
 // An externally completed login: the status probe starts reporting authenticated shortly after
 // startup, while the harness session is still unopened.
@@ -98,6 +105,17 @@ const AVAILABLE_MODELS = [
   { modelId: "fake-model", name: "Fake Model" },
   { modelId: "fake-model-2", name: "Fake Model 2" },
 ];
+
+/** Advertise per-model capabilities without relying on bridge YAML candidate lists. */
+function liveThinkingOptions() {
+  return [
+    { id: "model", currentValue: model, options: AVAILABLE_MODELS.map(entry => ({ value: entry.modelId, name: entry.name })) },
+    ...["thought_level", "reasoning_effort", "thinking_level"].map(id => ({
+      id, currentValue: "low",
+      options: (model === "fake-model-2" ? ["low"] : ["low", "high"]).map(value => ({ value })),
+    })),
+  ];
+}
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -510,7 +528,7 @@ function handle(message) {
     return;
   }
   if (message.method === "session/new") {
-    reply(message.id, { sessionId });
+    reply(message.id, { sessionId, ...(FLAGS.has("--live-thinking-options") ? { configOptions: liveThinkingOptions() } : {}) });
     return;
   }
   if (message.method === "session/load") {
@@ -527,7 +545,7 @@ function handle(message) {
       return;
     }
     model = message.params?.modelId ?? model;
-    reply(message.id, { modelId: model });
+    reply(message.id, { modelId: model, ...(FLAGS.has("--live-thinking-options") ? { configOptions: liveThinkingOptions() } : {}) });
     return;
   }
   if (message.method === "session/prompt") {

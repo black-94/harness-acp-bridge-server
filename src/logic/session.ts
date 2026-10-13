@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { CLIENT_VERSION, ProtocolAdapter, type OutputEvent, type Question, type RequestTicket } from "../acp/protocol.js";
 import { AuthStatusUnsupported, getAdapter, authMethods, type AdapterConfig, type AuthInfo, type AuthInteraction } from "../adapter/adapters.js";
 import { authTargetKey, type AuthCandidate, type AuthPrompt } from "./auth.js";
-import { declaredThinkingLevels, resolveHarness, type BridgeConfig } from "./config.js";
+import { resolveHarness, type BridgeConfig } from "./config.js";
 import { type CreateSessionParams } from "./create-params.js";
 import { authenticationRequired, BridgeError, deadline, errorInfo, isRecord, normalizeError } from "./errors.js";
 import { readJsonFileSafe, SessionStore } from "../io/persistence.js";
@@ -82,15 +82,14 @@ export class HarnessSession {
   constructor(readonly config: BridgeConfig, readonly params: CreateSessionParams, sessionId: string, redactor?: Redactor) {
     const harness = resolveHarness(config, params.harness);
     this.sessionId = sessionId;
-    this.adapter = getAdapter(harness.name);
+    this.adapter = getAdapter(harness);
     this.modelId = params.modelId; this.thinkingLevel = params.thinkingLevel; this.permissionMode = params.permissionMode;
-    this.assertThinkingLevel(params.modelId, params.thinkingLevel);
     const env = params.env;
-    let command = params.command || HARNESS_COMMANDS[harness.name];
+    let command = params.command || HARNESS_COMMANDS[harness];
     if (!command) throw new BridgeError("invalid_harness_command", "no built-in executable for selected harness");
     if (params.target === "local" && params.runtime === "direct") command = resolveLocalCommand(command, env, params.cwd);
     this.adapterConfig = {
-      harness: harness.name, cwd: params.cwd, modelId: params.modelId,
+      harness, cwd: params.cwd, modelId: params.modelId,
       command, args: params.args, env,
       launchMode: params.target === "remote" ? "ssh" : "local", runtime: params.runtime,
       permissionMode: params.permissionMode, acpModeId: config.launch.agyModeIds[params.permissionMode] ?? null,
@@ -130,7 +129,7 @@ export class HarnessSession {
       if (this.active) { this.active.unsupported.push(value); if (this.active.unsupported.length > 64) this.active.unsupported.shift(); }
       this.journal("unsupported", value); this.persist();
     });
-    this.journal("session_created", { harness: harness.name, cwd: params.cwd, options: this.options() });
+    this.journal("session_created", { harness, cwd: params.cwd, options: this.options() });
     this.persist();
   }
   get isClosed(): boolean { return ["closed", "failed", "interrupted"].includes(this.state); }
@@ -277,14 +276,9 @@ export class HarnessSession {
     }
     return null;
   }
-  private assertThinkingLevel(model: string, level: string | null): void {
-    const levels = declaredThinkingLevels(this.config, resolveHarness(this.config, this.params.harness).name, model);
-    if (level && levels !== null && !levels.includes(level)) throw new BridgeError("unsupported_request", `thinking_level ${level} is not configured for model ${model}`);
-  }
   async setOptions(options: { model_id?: string; thinking_level?: string; permission_mode?: CreateSessionParams["permissionMode"] }): Promise<Record<string, unknown>> {
     this.assertIdle();
     if (this.state !== "ready") throw authenticationRequired(this.sessionId);
-    this.assertThinkingLevel(options.model_id ?? this.modelId, options.thinking_level ?? null);
     const nextConfig = { ...this.adapterConfig, permissionMode: options.permission_mode ?? this.permissionMode,
       acpModeId: this.config.launch.agyModeIds[options.permission_mode ?? this.permissionMode] ?? null };
     this.adapter.validate(nextConfig);

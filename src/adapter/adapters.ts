@@ -452,7 +452,7 @@ export function getAdapter(name: string): HarnessAdapter {
 }
 
 export function isBuiltinHarness(name: string): name is HarnessName {
-  return name in ADAPTERS;
+  return Object.hasOwn(ADAPTERS, name);
 }
 
 /**

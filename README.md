@@ -107,7 +107,6 @@ return 409; unsupported operations/responses return 501; deadlines return 504.
 | Endpoint | Parameters and behavior |
 | --- | --- |
 | `ping` | `{}`. Server liveness, protocol version, PID, live-session count, config fingerprint. |
-| `search_harness` | `harness?`. Lists configured harnesses, models, declared thinking levels, and permission modes. Starts no harness and performs no discovery probes. |
 | `register_template` | `template` object. Validates and durably registers a launch template; duplicate names return `template_exists` (409). Starts no harness. Templates are **information only** — they are never passed to `create_session`. |
 | `delete_template` | `name`. Deletes a registered template; unknown names return `template_not_found` (404). Existing sessions are unaffected. |
 | `search_template` | Optional `name` (exact), `query` (case-insensitive substring of name/harness/description), `harness` (exact). Returns `{templates: [...]}` sorted by name; starts no harness. |
@@ -151,8 +150,9 @@ untrusted callers.
   image, mounts, ports, and network, so supplying them is rejected rather than silently ignored.
 
 Permission modes are `read`, `edit`, `auto`, `yolo`. Adapters determine whether a particular
-harness supports changing a mode live. Declared `thinking_levels: []` means none;
-omission means unknown, checked against live ACP options when available.
+harness supports changing a mode live. Model IDs and thinking levels are supplied explicitly
+(or mapped from template defaults) and validated against live ACP options when advertised,
+otherwise by the harness request itself; no YAML candidate lists constrain them.
 
 ## Launch templates and command validation
 
@@ -161,12 +161,18 @@ LLM) can read a known-good recipe, but `create_session` never references one: th
 parameter, no default merge, and no template identity in the snapshot. The intended flow is:
 
 1. `search_template` (exact `name`, or `query`/`harness`) and read the full returned object.
-2. Drop `name`/`description` and every field that does not apply to the intended session; keep only
-   the fields `create_session` accepts.
-3. Collect the missing values from the user — `model_id` is always required, and a `cwd` when the
-   template has none — plus any explicit overrides.
-4. `create_session` with those explicit parameters. Re-check the combination after overriding
-   `runtime`/`target` (Docker fields require `runtime: docker`; a remote target needs `remote_host`).
+2. Map non-null `model` → `model_id` and `thinking` → `thinking_level`, with user overrides taking
+   priority. Ask only for a missing model or `cwd`. Follow `special_instructions` throughout.
+3. The calling LLM executes `before_start` actions before startup, subject to user approval and
+   safety rules. These are natural-language prompts, not bridge-executed shell/argv hooks.
+4. Map Docker `network_mode` to session `host_network` (`host` → true; `none`/`proxy` → false)
+   and pass the returned `env`. Drop `name`/`description`/`model`/`thinking`/`network_mode`/`proxy_port`/
+   `before_start`/`after_start`/`special_instructions`
+   and inapplicable fields; `create_session` accepts none of these template-only fields. Pass only
+   allowed explicit parameters. Re-check combinations after overriding `runtime`/`target`.
+5. Complete any required authentication, then the calling LLM executes `after_start` after
+   successful startup before sending normal work. Stop and report failed actions or unavailable
+   tools rather than claiming success. Registration/search never executes these prompts.
 
 See [`templates/local.json`](templates/local.json) for a local/direct example and
 [`templates/docker.json`](templates/docker.json) for a Docker example. The local example uses PATH
@@ -183,10 +189,11 @@ curl -sS http://127.0.0.1:8787/api/create_session -H 'Content-Type: application/
 ```
 
 Template fields: `name` (unique identifier), `harness` (`codebuddy`/`codex`/`agy`), optional
-`description`, `target` (`local` by default), `remote_host`, `runtime` (`direct` by default),
+`description`, `model`, `thinking`, `before_start`, `after_start`, `special_instructions`,
+`target` (`local` by default), `remote_host`, `runtime` (`direct` by default),
 `command`, `args`, `env`, `permission_mode` (`auto` by default), `cwd` (absolute path), and Docker
 `docker_image`, `container_policy` (`remove`/`keep`), `login_dirs`, `mounts`, `ports`,
-`host_network`. Both `login_dirs` and `mounts` are bind-mount lists with `{source, target,
+`network_mode` (`none`/`host`/`proxy`) and `proxy_port`. Both `login_dirs` and `mounts` are bind-mount lists with `{source, target,
 read_only?}`; login mounts persist the harness's own credentials, not bridge credentials.
 Source/target paths must be absolute, targets cannot repeat, and host networking cannot coexist
 with published ports. Unknown fields, malformed data, Docker fields on a direct template, managed
@@ -196,8 +203,45 @@ requires a nonempty `remote_host` (SSH hostname/alias, optionally `user@host`); 
 must omit it or use null. Target and runtime are independent, allowing local/direct, remote/direct,
 local/Docker and remote/Docker recipes.
 
+`model` and `thinking` are optional nonblank, NUL-free strings (default null); they provide defaults,
+not candidate lists. The three instruction fields are optional NUL-free natural-language strings
+(default null, empty text is allowed) for the **calling LLM**. They are stored and returned verbatim,
+never executed by the server, and never forwarded as session parameters. Legacy templates without
+these fields still load with null defaults.
+
+### Docker network modes
+
+Choose exactly one template `network_mode`:
+
+| Mode | Meaning | Session expansion |
+| --- | --- | --- |
+| `none` (default) | Ordinary Docker bridge network, no active proxy values | `host_network: false` |
+| `host` | Host network, no active proxy values or published ports | `host_network: true` |
+| `proxy` | Ordinary bridge network with a generic HTTP proxy, not tied to Xray | `host_network: false` and the generated `env` |
+
+For `proxy`, specify only `proxy_port` (integer 1–65535). Registration generates both lowercase
+`http_proxy` and `https_proxy` as `http://host.docker.internal:PORT` and `no_proxy` as
+`localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local,.internal`.
+Stale lowercase/uppercase proxy aliases (including ALL_PROXY) are replaced; unrelated env values
+are preserved. `proxy_port` is required for `proxy` and must be omitted/null otherwise. `host`/`proxy`
+require Docker; direct templates accept only the neutral `none` default.
+
+See [`templates/docker-host.json`](templates/docker-host.json) and
+[`templates/docker-proxy.json`](templates/docker-proxy.json). Their images/paths and the example
+proxy port must be confirmed and replaced before registration. The fixed host address must be
+reachable from the execution host's container network (the remote machine for SSH/Docker).
+Container localhost is not the host. Linux may need host-gateway configuration; the bridge does not
+silently alter Docker, proxy listeners or firewalls. The HTTP client must support the generated
+proxy settings/CIDR bypasses; env delivery alone is not proof of connectivity. This config is not
+for Docker daemon/image pulls or the Pi/MCP bridge client.
+
+**No legacy template compatibility:** template `host_network` is rejected. Re-register old templates
+using `network_mode`/`proxy_port`; an old on-disk registry containing removed fields must be replaced
+before starting the server. `create_session` still uses explicit `host_network`/`env`, and rejects
+`network_mode`/`proxy_port` as template-only fields. Registration/search never opens a connection.
+
 Templates persist atomically in `<state_dir>/templates.json` (0600), survive server restarts, and
-are returned by search in full. Environment values are stored unchanged in this private registry;
+are returned by search in full. Non-proxy environment values are stored unchanged in this private registry;
 do not put secrets in templates unless necessary. To change a template, delete then register it
 again.
 
@@ -208,9 +252,17 @@ non-empty `login_dirs`/`mounts`/`ports`, a present `docker_image`/`docker_id`/`c
 on a direct runtime so an expanded template can be passed verbatim, but their **types** are still
 validated rather than silently ignored. For a new Docker container, `login_dirs` and `mounts` are
 merged; after the merge the mount targets must be unique and the total is capped at 64. For
-`runtime: docker`, `cwd` is the absolute path *inside the container*. YAML `harnesses` still declares
-models and the default harness; `harnesses.*.command/args/env` and
-`launch.codebuddy_command/codex_command/agy_command` are removed and rejected.
+`runtime: docker`, `cwd` is the absolute path *inside the container*. All built-in adapters
+(`codebuddy`, `codex`, `agy`) are always available without YAML declarations. Explicit session
+`harness` wins; otherwise `default_harness` is used (omitted/null defaults to `codex`). A
+`default_harness` override must name a built-in adapter. A YAML file is optional when all service
+settings use defaults; explicit missing config paths remain errors rather than being ignored.
+
+**Migration:** `search_harness` is removed (HTTP 404); use launch templates instead. Remove the
+entire obsolete YAML `harnesses` section, including descriptions, model/thinking candidate lists,
+and command/args/env declarations. Move desired launch/model/thinking defaults to templates or
+explicit session fields. YAML containing `harnesses` or
+`launch.codebuddy_command/codex_command/agy_command` is rejected.
 
 A nonempty `command` takes priority (absolute path or executable name). Empty/null uses
 `codebuddy`, `codex-acp`, or `agy_acp_server` on PATH. Local/direct checks the server's PATH;

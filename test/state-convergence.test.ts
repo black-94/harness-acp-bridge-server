@@ -30,7 +30,6 @@ async function setup(settings: Record<string, unknown> = {}) {
     timeouts: { startup_timeout_seconds: 3, request_timeout_seconds: 1, turn_timeout_seconds: 5, turn_cancel_timeout_seconds: 0.3, terminate_grace_seconds: 0.05, remote_cleanup_timeout_seconds: 0.05, authentication_timeout_seconds: 0.5 },
     authentication: { rate_limit: { enabled: false } },
     default_harness: "codebuddy",
-    harnesses: { codebuddy: { models: [{ id: "fake-model", thinking_levels: ["low", "high"] }] } },
     ...settings,
   }));
   const config = loadConfig(path);

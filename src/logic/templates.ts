@@ -4,7 +4,8 @@
  *
  * Templates are **information only**: `create_session` no longer references a template, merges its
  * defaults, or records a selected template's identity. A caller (typically an LLM) reads a template,
- * drops `name`/`description` and fields that do not apply, and passes the allowed fields directly to
+ * maps `model`/`thinking` to session options, follows natural-language instructions itself,
+ * drops template-only fields and fields that do not apply, and passes allowed fields directly to
  * `create_session`. Registration/search/delete exist to store and serve that information.
  */
 import { existsSync, lstatSync, readFileSync } from "node:fs";
@@ -12,15 +13,24 @@ import { join } from "node:path";
 import { z } from "zod";
 import { getAdapter } from "../adapter/adapters.js";
 import { writeJsonAtomicSync } from "../io/persistence.js";
-import { normalizeArgs, normalizeCommand, normalizeCreateParams, normalizeEnv } from "./create-params.js";
+import { hasProxyEnv, normalizeArgs, normalizeCommand, normalizeCreateParams, normalizeEnv } from "./create-params.js";
 import { BridgeError } from "./errors.js";
 
 const text = z.string().refine(value => !value.includes("\0"), "must not contain NUL");
 const mount = z.object({ source: text, target: text, read_only: z.boolean().default(false) }).strict();
+/** Common local/private bypasses; consumers must support CIDR entries to honor the ranges. */
+export const DEFAULT_NO_PROXY = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local,.internal";
+const MANAGED_PROXY_KEYS = ["http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "all_proxy", "ALL_PROXY"];
 export const templateSchema = z.object({
   name: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
   description: text.nullable().default(null),
   harness: z.enum(["codebuddy", "codex", "agy"]),
+  model: text.refine(value => value.trim().length > 0, "must not be blank").nullable().default(null),
+  thinking: text.refine(value => value.trim().length > 0, "must not be blank").nullable().default(null),
+  // Natural-language guidance for the calling LLM, never server-executed hooks or session params.
+  before_start: text.nullable().default(null),
+  after_start: text.nullable().default(null),
+  special_instructions: text.nullable().default(null),
   runtime: z.enum(["direct", "docker"]).default("direct"),
   target: z.enum(["local", "remote"]).default("local"),
   remote_host: text.transform(value => value.trim()).pipe(z.string().min(1)).nullable().default(null),
@@ -38,7 +48,9 @@ export const templateSchema = z.object({
     host_port: z.number().int(), container_port: z.number().int(),
     protocol: z.enum(["tcp", "udp"]).default("tcp"), host_ip: text.nullable().default(null),
   }).strict()).default([]),
-  host_network: z.boolean().default(false),
+  // Template-only choice; the caller maps host to session host_network=true.
+  network_mode: z.enum(["none", "host", "proxy"]).default("none"),
+  proxy_port: z.number().int().min(1).max(65535).nullable().default(null),
 }).strict();
 export type LaunchTemplate = z.infer<typeof templateSchema>;
 export const HARNESS_COMMANDS: Readonly<Record<string, string>> = {
@@ -72,10 +84,13 @@ export function templateDefaults(template: LaunchTemplate): Record<string, unkno
   return {
     harness: template.harness, runtime: template.runtime,
     target: template.target, remote_host: template.remote_host, permission_mode: template.permission_mode,
+    env: template.env,
+    ...(template.model !== null ? { model_id: template.model } : {}),
+    ...(template.thinking !== null ? { thinking_level: template.thinking } : {}),
     ...(template.cwd !== null ? { cwd: template.cwd } : {}),
     ...(template.runtime === "docker" ? {
       docker_image: template.docker_image, container_policy: template.container_policy ?? "remove",
-      mounts: [...template.login_dirs, ...template.mounts], ports: template.ports, host_network: template.host_network,
+      mounts: [...template.login_dirs, ...template.mounts], ports: template.ports, host_network: template.network_mode === "host",
     } : {}),
   };
 }
@@ -93,8 +108,20 @@ export function validateTemplate(raw: unknown): LaunchTemplate {
     throw new BridgeError("invalid_template", error instanceof Error ? error.message : String(error));
   }
   if (template.runtime === "direct" && (template.docker_image !== null || template.container_policy !== undefined ||
-      template.login_dirs.length || template.mounts.length || template.ports.length || template.host_network)) {
+      template.login_dirs.length || template.mounts.length || template.ports.length || template.network_mode !== "none")) {
     throw new BridgeError("invalid_template", "Docker fields require runtime=docker");
+  }
+  if (template.network_mode === "proxy") {
+    if (template.proxy_port === null) throw new BridgeError("invalid_template", "network_mode=proxy requires proxy_port");
+    const proxyUrl = `http://host.docker.internal:${template.proxy_port}`;
+    // Mode/port own all proxy settings, including stale aliases that could override lowercase keys.
+    const otherEnv = Object.fromEntries(Object.entries(template.env).filter(([key]) => !MANAGED_PROXY_KEYS.includes(key)));
+    template.env = { ...otherEnv, http_proxy: proxyUrl, https_proxy: proxyUrl, no_proxy: DEFAULT_NO_PROXY };
+  } else {
+    if (template.proxy_port !== null) throw new BridgeError("invalid_template", "proxy_port requires network_mode=proxy");
+    if (template.runtime === "docker" && hasProxyEnv(template.env)) {
+      throw new BridgeError("invalid_template", "proxy environment variables require network_mode=proxy");
+    }
   }
   try {
     const options = normalizeCreateParams({ cwd: "/work", model_id: "template-validation", ...templateDefaults(template) });

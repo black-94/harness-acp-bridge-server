@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import { supportedPermissionModes, type PermissionMode } from "../adapter/adapters.js";
+import { isBuiltinHarness, type HarnessName } from "../adapter/adapters.js";
 
 export const CONFIG_ENV = "HARNESS_ACP_BRIDGE_CONFIG";
 export const SCHEMA_VERSION = 2;
@@ -61,26 +61,6 @@ export function defaultConfigPath(): string {
   const configured = process.env.XDG_CONFIG_HOME;
   const base = configured ? configured : join(homedir(), ".config");
   return join(base, SERVICE_NAME, "config.yaml");
-}
-
-export interface ModelConfig {
-  /** Model id passed verbatim to the harness ACP `session/set_model`. */
-  id: string;
-  /** Human readable label; defaults to the id when omitted. */
-  name: string;
-  /**
-   * Thinking levels this model may be configured with, as declared in the configuration
-   * file. `null` means the file does not declare them: the level is unknown, never assumed
-   * supported, and validated only against the live ACP config options when advertised.
-   * `[]` means the model was explicitly declared to support none.
-   */
-  thinkingLevels: string[] | null;
-}
-
-export interface HarnessConfig {
-  name: string;
-  models: ModelConfig[];
-  description: string | null;
 }
 
 export interface BridgeConfig {
@@ -148,27 +128,11 @@ export interface BridgeConfig {
       windowSeconds: number;
     };
   };
-  harnesses: Record<string, HarnessConfig>;
-  defaultHarness: string | null;
+  /** Built-in harness used when create_session omits harness; defaults to Codex. */
+  defaultHarness: HarnessName;
   /** Stable hash of the resolved settings; used to detect config drift. */
   fingerprint: string;
 }
-
-const modelSchema = z
-  .object({
-    id: z.string().min(1),
-    name: z.string().min(1).optional(),
-    // Optional. Omitted/`null` means "not declared" (unknown); `[]` means "declared none".
-    thinking_levels: z.array(z.string().min(1)).nullable().default(null),
-  })
-  .strict();
-
-const harnessSchema = z
-  .object({
-    models: z.array(modelSchema).default([]),
-    description: z.string().nullable().default(null),
-  })
-  .strict();
 
 const sizeValue = z.union([z.number(), z.string()]);
 
@@ -247,8 +211,7 @@ const fileSchema = z
       })
       .strict()
       .default({}),
-    default_harness: z.string().nullable().default(null),
-    harnesses: z.record(harnessSchema).default({}),
+    default_harness: z.enum(["codebuddy", "codex", "agy"]).nullable().default("codex"),
   })
   .strict();
 
@@ -318,35 +281,6 @@ function resolveConfig(file: FileConfig, configPath: string | null): BridgeConfi
     throw new ConfigError("buffers.preview_text_bytes must be at least 4 for UTF-8 paging");
   }
 
-  const harnesses: Record<string, HarnessConfig> = {};
-  const modelIds = new Set<string>();
-  for (const [name, harness] of Object.entries(file.harnesses)) {
-    const models: ModelConfig[] = harness.models.map((model) => {
-      if (modelIds.has(`${name}:${model.id}`)) {
-        throw new ConfigError(`duplicate model id ${JSON.stringify(model.id)} in harness ${name}`);
-      }
-      modelIds.add(`${name}:${model.id}`);
-      return {
-        id: model.id,
-        name: model.name ?? model.id,
-        thinkingLevels: model.thinking_levels === null ? null : [...model.thinking_levels],
-      };
-    });
-    harnesses[name] = {
-      name,
-      models,
-      description: harness.description,
-    };
-  }
-
-  let defaultHarness = file.default_harness;
-  if (defaultHarness !== null && !(defaultHarness in harnesses)) {
-    throw new ConfigError(`default_harness ${JSON.stringify(defaultHarness)} is not a configured harness`);
-  }
-  if (defaultHarness === null && Object.keys(harnesses).length === 1) {
-    defaultHarness = Object.keys(harnesses)[0] ?? null;
-  }
-
   const resolved: Omit<BridgeConfig, "fingerprint"> = {
     schemaVersion: SCHEMA_VERSION,
     configPath,
@@ -398,8 +332,7 @@ function resolveConfig(file: FileConfig, configPath: string | null): BridgeConfi
         windowSeconds: file.authentication.rate_limit.window_seconds,
       },
     },
-    harnesses,
-    defaultHarness,
+    defaultHarness: file.default_harness ?? "codex",
   };
 
   const fingerprint = createHash("sha256")
@@ -434,87 +367,11 @@ export function loadConfig(explicitPath?: string): BridgeConfig {
   return resolveConfig(readConfigFile(path), path);
 }
 
-/** Resolve a harness by name, preferring the configured default. */
-export function resolveHarness(config: BridgeConfig, name?: string | null): HarnessConfig {
+/** Select a built-in adapter directly; no YAML harness declaration is needed. */
+export function resolveHarness(config: BridgeConfig, name?: string | null): HarnessName {
   const target = name ?? config.defaultHarness;
-  if (target === null || target === undefined) {
-    throw new ConfigError("no harness selected and no default_harness is configured");
+  if (!isBuiltinHarness(target)) {
+    throw new ConfigError(`unknown harness ${JSON.stringify(target)}; supported: codebuddy, codex, agy`);
   }
-  const harness = config.harnesses[target];
-  if (!harness) {
-    const known = Object.keys(config.harnesses).sort().join(", ") || "<none>";
-    throw new ConfigError(`unknown harness ${JSON.stringify(target)}; configured: ${known}`);
-  }
-  return harness;
-}
-
-/** Look up a configured model, returning `undefined` when it is not listed. */
-export function findModel(
-  config: BridgeConfig,
-  harness: string,
-  modelId: string,
-): ModelConfig | undefined {
-  return config.harnesses[harness]?.models.find((model) => model.id === modelId);
-}
-
-/**
- * Declared thinking levels for a configured model: the configured array (which may be empty),
- * or `null` when the configuration does not declare them. Never guesses a level.
- */
-export function declaredThinkingLevels(
-  config: BridgeConfig,
-  harness: string,
-  modelId: string,
-): string[] | null {
-  return findModel(config, harness, modelId)?.thinkingLevels ?? null;
-}
-
-/** One configured model's declaration, as reported by `search_harness`. */
-export interface HarnessModelInfo {
-  id: string;
-  name: string;
-  /** Declared levels, or `null` when the configuration does not declare them. */
-  thinking_levels: string[] | null;
-}
-
-/** One configured harness's declaration, as reported by `search_harness`. */
-export interface HarnessInfo {
-  name: string;
-  description: string | null;
-  /**
-   * Permission modes the built-in adapter can actually route with this configuration. Empty
-   * for a configured entry without a built-in adapter.
-   */
-  permission_modes: PermissionMode[];
-  models: HarnessModelInfo[];
-}
-
-/** Describe one configured harness from the configuration file only. */
-export function describeHarness(config: BridgeConfig, name: string): HarnessInfo {
-  const harness = resolveHarness(config, name);
-  return {
-    name: harness.name,
-    description: harness.description,
-    permission_modes: supportedPermissionModes(harness.name, config.launch.agyModeIds),
-    models: harness.models.map((model) => ({
-      id: model.id,
-      name: model.name,
-      thinking_levels: model.thinkingLevels === null ? null : [...model.thinkingLevels],
-    })),
-  };
-}
-
-/**
- * Describe one configured harness, or every configured harness, from the configuration file
- * only. An explicitly requested unknown harness is an error (see `resolveHarness`).
- */
-export function harnessInfo(
-  config: BridgeConfig,
-  harness?: string | null,
-): Record<string, HarnessInfo> {
-  const names =
-    harness !== undefined && harness !== null ? [harness] : Object.keys(config.harnesses).sort();
-  const described: Record<string, HarnessInfo> = {};
-  for (const name of names) described[name] = describeHarness(config, name);
-  return described;
+  return target;
 }

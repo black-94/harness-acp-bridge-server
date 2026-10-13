@@ -1,6 +1,6 @@
 {
   "name": "@black942026/harness-acp-bridge-server",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "type": "module",
   "description": "HTTP server for session-scoped ACP harness communication, lossless journaling, and live previews.",
   "license": "MIT",

@@ -78,6 +78,11 @@ const MAX_DOCKER_MOUNTS = 64;
 const MAX_DOCKER_PORTS = 64;
 const PERMISSION_MODES: readonly PermissionMode[] = ["read", "edit", "auto", "yolo"];
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+export const PROXY_ENV_KEYS = ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] as const;
+/** no_proxy only controls bypasses; it does not enable a proxy. */
+export function hasProxyEnv(env: Record<string, string>): boolean {
+  return PROXY_ENV_KEYS.some(key => Boolean(env[key]?.trim()));
+}
 
 export interface CreateSessionParams {
   harness: string | null;
@@ -412,6 +417,10 @@ export function normalizeCreateParams(params: Record<string, unknown>): CreateSe
     throw new ParamError("invalid_param", "host_network must be boolean");
   }
   const hostNetworkRequested = rawHostNetwork === true;
+  // Docker network choices are exclusive: ordinary bridge, host network, or bridge + proxy env.
+  if (hostNetworkRequested && hasProxyEnv(env)) {
+    throw new ParamError("invalid_param", "host_network cannot be combined with proxy environment variables; use Docker bridge + env.http_proxy for proxy mode");
+  }
 
   const effective: Record<string, boolean> = {
     container_policy: containerPolicy !== null,

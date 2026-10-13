@@ -1,0 +1,23 @@
+{
+  "name": "codex-docker-host",
+  "description": "Codex in Docker host networking; replace the image and host paths and confirm host-network support on the execution target before registration",
+  "harness": "codex",
+  "model": null,
+  "thinking": null,
+  "before_start": "Confirm the image and mount paths, and verify that Docker host networking is supported and enabled on the execution target. Do not configure a proxy or published ports in host mode.",
+  "after_start": "Complete any required harness authentication and check connectivity before normal work.",
+  "special_instructions": "Host networking and proxy mode are exclusive. Do not change Docker networking settings without user approval.",
+  "target": "local",
+  "runtime": "docker",
+  "command": null,
+  "args": [],
+  "env": {},
+  "permission_mode": "auto",
+  "cwd": "/workspace",
+  "docker_image": "your-codex-image:latest",
+  "mounts": [
+    { "source": "/absolute/host/project", "target": "/workspace", "read_only": false }
+  ],
+  "ports": [],
+  "network_mode": "host"
+}

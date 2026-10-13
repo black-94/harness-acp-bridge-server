@@ -603,6 +603,18 @@ describe("create_session parameter validation", () => {
     }
   };
 
+  it("keeps session proxy env on bridge networking and refuses mixing it with host network", () => {
+    const env = { http_proxy: "http://host.docker.internal:12345", https_proxy: "http://host.docker.internal:12345", no_proxy: "localhost,10.0.0.0/8" };
+    const docker = { ...base, runtime: "docker", docker_image: "img", env };
+    expect(normalizeCreateParams(docker)).toMatchObject({ env, dockerHostNetwork: false });
+    for (const key of ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]) {
+      expectCode({ ...docker, host_network: true, env: { [key]: "http://proxy:12345" } }, "invalid_param");
+    }
+    expect(normalizeCreateParams({ ...docker, host_network: true, env: { http_proxy: "", no_proxy: "localhost" } }).dockerHostNetwork).toBe(true);
+    expectCode({ ...base, network_mode: "none" }, "unknown_param");
+    expectCode({ ...base, proxy_port: 12345 }, "unknown_param");
+  });
+
   it("applies the reference defaults", () => {
     const params = normalizeCreateParams(base);
     expect(params).toMatchObject({

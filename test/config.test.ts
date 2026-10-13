@@ -1,141 +1,81 @@
-/**
- * Unit coverage for the configuration declaration surface: the optional per-model
- * `thinking_levels`, the `harness_info` description built from the configuration file only,
- * and `declaredThinkingLevels`. No daemon or harness is started.
- */
+/** Built-in harnesses and default settings work without a YAML file or harness declarations. */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-
-import {
-  ConfigError,
-  declaredThinkingLevels,
-  findModel,
-  harnessInfo,
-  loadConfig,
-  type BridgeConfig,
-} from "../src/logic/config";
+import { ConfigError, resolveHarness, loadConfig, type BridgeConfig } from "../src/logic/config";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
   vi.unstubAllEnvs();
   for (const cleanup of cleanups.splice(0)) cleanup();
 });
-
-function configFromText(text: string): BridgeConfig {
+function directory(): string {
   const dir = mkdtempSync(join(tmpdir(), "hab-config-"));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-  const path = join(dir, "config.yaml");
+  return dir;
+}
+function configFromText(text: string): BridgeConfig {
+  const path = join(directory(), "config.yaml");
   writeFileSync(path, text);
   return loadConfig(path);
 }
 
-const DECLARED = `schema_version: 2
-default_harness: codebuddy
-harnesses:
-  codebuddy:
-    models:
-      - id: m-declared
-        name: Declared
-        thinking_levels: [low, high]
-      - id: m-none
-        name: None
-        thinking_levels: []
-      - id: m-unknown
-        name: Unknown
-  codex:
-    models:
-      - id: c1
-        name: Codex One
-  agy:
-    models:
-      - id: a1
-        name: Agy One
-launch:
-  agy_edit_mode_id: agy-edit
-`;
-
 describe("configuration path diagnostics", () => {
   it("names a missing explicit or environment-selected YAML path", () => {
-    const path = join(mkdtempSync(join(tmpdir(), "hab-config-")), "missing.yaml");
-    cleanups.push(() => rmSync(join(path, ".."), { recursive: true, force: true }));
+    const path = join(directory(), "missing.yaml");
     expect(() => loadConfig(path)).toThrow(`configured YAML file does not exist: ${path}`);
     vi.stubEnv("HARNESS_ACP_BRIDGE_CONFIG", path);
     expect(() => loadConfig()).toThrow(`configured YAML file does not exist: ${path}`);
   });
   it("rejects a directory used as the YAML file with a contextual ConfigError", () => {
-    const dir = mkdtempSync(join(tmpdir(), "hab-config-"));
-    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const dir = directory();
     expect(() => loadConfig(dir)).toThrow(ConfigError);
     expect(() => loadConfig(dir)).toThrow(`could not read configured YAML file ${dir}: EISDIR`);
   });
 });
 
-describe("model thinking_levels declaration", () => {
-  it("parses declared, empty, and undeclared thinking levels", () => {
-    const config = configFromText(DECLARED);
-    expect(findModel(config, "codebuddy", "m-declared")?.thinkingLevels).toEqual(["low", "high"]);
-    // An explicit empty list means "declared to support none", not unknown.
-    expect(findModel(config, "codebuddy", "m-none")?.thinkingLevels).toEqual([]);
-    // Omitted is unknown, reported as null and never assumed supported.
-    expect(findModel(config, "codebuddy", "m-unknown")?.thinkingLevels).toBeNull();
-    expect(declaredThinkingLevels(config, "codebuddy", "m-unknown")).toBeNull();
-    expect(declaredThinkingLevels(config, "codebuddy", "not-configured")).toBeNull();
-    expect(declaredThinkingLevels(config, "codebuddy", "m-declared")).toEqual(["low", "high"]);
+describe("declaration-free harness configuration", () => {
+  it("uses defaults when no YAML exists and selects Codex by default", () => {
+    vi.stubEnv("XDG_CONFIG_HOME", directory());
+    vi.stubEnv("HARNESS_ACP_BRIDGE_CONFIG", "");
+    const config = loadConfig();
+    expect(config.configPath).toBeNull();
+    expect(config.defaultHarness).toBe("codex");
+    expect(resolveHarness(config)).toBe("codex");
+    expect(config.server).toMatchObject({ host: "127.0.0.1", port: 8787 });
+    expect(config.sessions.maxConcurrency).toBe(2);
+    expect(config).not.toHaveProperty("harnesses");
+    for (const name of ["codebuddy", "codex", "agy"]) expect(resolveHarness(config, name)).toBe(name);
   });
-
-  it("rejects a malformed thinking_levels value", () => {
-    expect(() =>
-      configFromText(
-        `schema_version: 2
-harnesses:
+  it("treats empty YAML and a null default_harness as built-in defaults", () => {
+    expect(resolveHarness(configFromText(""))).toBe("codex");
+    expect(resolveHarness(configFromText("default_harness: null\n"))).toBe("codex");
+  });
+  it.each(["codebuddy", "codex", "agy"])("supports default_harness=%s without declarations", name => {
+    const config = configFromText(`default_harness: ${name}\n`);
+    expect(config.defaultHarness).toBe(name);
+    expect(resolveHarness(config)).toBe(name);
+    expect(resolveHarness(config, "codebuddy")).toBe("codebuddy");
+  });
+  it.each(["unknown", "constructor", "__proto__", "toString"])("rejects non-adapter harness %s", name => {
+    expect(() => configFromText(`default_harness: ${name}\n`)).toThrow(ConfigError);
+    expect(() => resolveHarness(configFromText(""), name)).toThrow(ConfigError);
+  });
+  it.each(["harnesses: {}", "harnesses:\n  codebuddy: {}", `harnesses:
   codebuddy:
     models:
-      - id: m
-        thinking_levels: high
-`,
-      ),
-    ).toThrow(ConfigError);
+      - id: old-model
+        thinking_levels: [low, high]
+`])("rejects obsolete harness declarations: %s", text => {
+    expect(() => configFromText(text)).toThrow(/Unrecognized key/);
   });
-});
-
-describe("harness_info description", () => {
-  it("lists every configured harness in sorted order with routable permission modes", () => {
-    const info = harnessInfo(configFromText(DECLARED));
-    expect(Object.keys(info)).toEqual(["agy", "codebuddy", "codex"]);
-    expect(info.codebuddy.permission_modes).toEqual(["read", "edit", "auto", "yolo"]);
-    expect(info.codex.permission_modes).toEqual(["read", "edit", "auto", "yolo"]);
-    // Agy read/edit require an explicit mode id; only edit is configured here.
-    expect(info.agy.permission_modes).toEqual(["edit", "auto", "yolo"]);
-  });
-
-  it("reports each model's id, name, and declared thinking_levels", () => {
-    const info = harnessInfo(configFromText(DECLARED));
-    expect(info.codebuddy.models).toEqual([
-      { id: "m-declared", name: "Declared", thinking_levels: ["low", "high"] },
-      { id: "m-none", name: "None", thinking_levels: [] },
-      { id: "m-unknown", name: "Unknown", thinking_levels: null },
-    ]);
-    // A harness with no declarations is still listed, with null levels and full modes.
-    expect(info.codex.models).toEqual([{ id: "c1", name: "Codex One", thinking_levels: null }]);
-  });
-
-  it("can select one harness and rejects an unknown one", () => {
-    const config = configFromText(DECLARED);
-    expect(Object.keys(harnessInfo(config, "codex"))).toEqual(["codex"]);
-    expect(() => harnessInfo(config, "nope")).toThrow(ConfigError);
-  });
-
-  it("reports agy yolo (defaulted) as routable and read/edit when configured", () => {
-    const config = configFromText(`${DECLARED}  agy_read_mode_id: agy-read
+  it("keeps agy permission mode routing configurable independently of harness declarations", () => {
+    const config = configFromText(`launch:
+  agy_read_mode_id: agy-read
+  agy_edit_mode_id: agy-edit
   agy_yolo_mode_id: custom-yolo
 `);
-    expect(harnessInfo(config, "agy").agy.permission_modes).toEqual([
-      "read",
-      "edit",
-      "auto",
-      "yolo",
-    ]);
+    expect(config.launch.agyModeIds).toEqual({ read: "agy-read", edit: "agy-edit", auto: null, yolo: "custom-yolo" });
   });
 });

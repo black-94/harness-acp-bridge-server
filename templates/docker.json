@@ -2,6 +2,11 @@
   "name": "codebuddy-docker",
   "description": "CodeBuddy ACP in Docker; replace the image and host login directory before registration",
   "harness": "codebuddy",
+  "model": null,
+  "thinking": null,
+  "before_start": "Confirm the Docker image and host mount paths with the user and check that they are available on the execution host.",
+  "after_start": "Complete any required harness authentication and wait until the session is ready before sending work.",
+  "special_instructions": "Login mounts persist the harness credentials, not bridge credentials. Do not put secrets in template env.",
   "target": "local",
   "remote_host": null,
   "runtime": "docker",
@@ -19,5 +24,5 @@
     { "source": "/absolute/host/project", "target": "/workspace", "read_only": false }
   ],
   "ports": [],
-  "host_network": false
+  "network_mode": "none"
 }

@@ -17,7 +17,7 @@ async function setup(settings: Record<string, unknown> = {}, flags: string[] = [
     server: { host: "127.0.0.1", port: 0 }, sessions: { max_concurrency: 4, reap_interval_seconds: 0.05 },
     timeouts: { startup_timeout_seconds: 3, request_timeout_seconds: 1, turn_timeout_seconds: 5, turn_cancel_timeout_seconds: 0.3, terminate_grace_seconds: 0.05, remote_cleanup_timeout_seconds: 0.05, authentication_timeout_seconds: 0.5 },
     authentication: { rate_limit: { enabled: false } },
-    default_harness: harness, harnesses: { [harness]: { models: [{ id: "fake-model", thinking_levels: ["low", "high"] }, { id: "fake-model-2", thinking_levels: ["low"] }] } }, ...settings }));
+    default_harness: harness, ...settings }));
   const config = loadConfig(path);
   const server = new HarnessHttpServer(config);
   const address = await server.start();
@@ -80,10 +80,36 @@ async function nextAuthQuestion(request: (method: string, params?: Record<string
   throw new Error("no auth question arrived");
 }
 describe("HTTP server contract and session state machine", () => {
-  it("accepts only POST JSON and searches configuration without starting a harness", async () => {
+  it("launches every built-in adapter and the default harness without any YAML file", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hab-no-yaml-"));
+    vi.stubEnv("HARNESS_ACP_BRIDGE_CONFIG", ""); vi.stubEnv("XDG_CONFIG_HOME", dir);
+    const defaults = loadConfig();
+    expect(defaults.configPath).toBeNull(); expect(defaults).not.toHaveProperty("harnesses");
+    // Only isolate filesystem/port resources; harness and all policies remain built-in defaults.
+    const server = new HarnessHttpServer({ ...defaults, paths: { stateDir: dir, sessionDir: dir }, server: { ...defaults.server, port: 0 } });
+    cleanup.push(async () => { await server.stop(); rmSync(dir, { recursive: true, force: true }); });
+    const address = await server.start();
+    const request = async (method: string, params: Record<string, unknown>) => {
+      const response = await fetch(`http://127.0.0.1:${address.port}/api/${method}`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(params),
+      });
+      return await response.json() as any;
+    };
+    for (const harness of [undefined, "codebuddy", "codex", "agy"]) {
+      const created = await request("create_session", { command: process.execPath,
+        args: [fixture, `--fake-agent=${harness ?? "codex"}`], cwd: dir, model_id: "fake-model",
+        ...(harness ? { harness } : {}) });
+      expect(created.ok, JSON.stringify(created)).toBe(true);
+      expect(created.data.harness).toBe(harness ?? "codex");
+      expect((await request("close_session", { session_id: created.data.session_id })).ok).toBe(true);
+    }
+    // Inherited object keys must not masquerade as registered adapters.
+    expect((await request("create_session", { harness: "constructor", cwd: dir, model_id: "fake-model" })).error.code).toBe("invalid_param");
+  });
+  it("accepts only POST JSON and rejects the removed search_harness endpoint without starting a harness", async () => {
     const app = await setup();
     const ping = await app.request("ping"); expect(ping.data.sessions).toBe(0); expect(ping.data.protocol_version).toBe(4);
-    const found = await app.request("search_harness"); expect(found.data.harnesses.codebuddy.models[0].id).toBe("fake-model");
+    expect((await app.request("search_harness")).status).toBe(404);
     expect((await app.request("ping")).data.sessions).toBe(0);
     expect((await fetch(`${app.base}/api/ping`)).status).toBe(405);
     const invalid = await fetch(`${app.base}/api/ping`, { method: "POST", headers: { "content-type": "application/json" }, body: "{" });
@@ -190,7 +216,7 @@ describe("HTTP server contract and session state machine", () => {
     expect(answer.ok).toBe(true); expect((await app.complete(session, message)).result.text).toContain("回答😀");
   });
   it.each(["codebuddy", "codex", "agy"])("routes session model/thinking/permission options for %s", async harness => {
-    const app = await setup({}, [], harness); const session = await app.create();
+    const app = await setup({}, ["--live-thinking-options"], harness); const session = await app.create();
     const result = await app.request("set_session_options", { session_id: session, model_id: "fake-model-2", thinking_level: "low", permission_mode: "yolo" });
     expect(result.ok, JSON.stringify(result)).toBe(true);
     expect(result.data.options).toEqual({ model_id: "fake-model-2", thinking_level: "low", permission_mode: "yolo" });

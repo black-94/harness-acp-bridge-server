@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { stringify } from "yaml";
 import { loadConfig } from "../src/logic/config";
-import { TemplateRegistry, assertHarnessIdentity, validateTemplate } from "../src/logic/templates";
+import { DEFAULT_NO_PROXY, TemplateRegistry, assertHarnessIdentity, templateDefaults, validateTemplate } from "../src/logic/templates";
 import { resolveLocalCommand, resolveTargetCommand } from "../src/io/commands";
 import { shellJoin, type LaunchSpec } from "../src/io/runtime";
 import { HarnessHttpServer } from "../dist/http/server.js";
@@ -22,13 +22,66 @@ const docker = { ...base, runtime: "docker", docker_image: "test/image:1" };
 
 describe("template validation and durable registry", () => {
   it("accepts the shipped local/Docker templates and normalizes optional fields", () => {
-    for (const [file, runtime] of [["local", "direct"], ["docker", "docker"]]) {
+    for (const [file, runtime] of [["local", "direct"], ["docker", "docker"], ["docker-host", "docker"], ["docker-proxy", "docker"]]) {
       expect(validateTemplate(JSON.parse(readFileSync(new URL(`../templates/${file}.json`, import.meta.url), "utf8"))))
         .toMatchObject({ runtime, target: "local", remote_host: null, permission_mode: "auto" });
     }
     expect(validateTemplate({ ...base, command: " " })).toMatchObject({ command: null, args: [], env: {}, cwd: null,
       runtime: "direct", target: "local", remote_host: null, permission_mode: "auto" });
     expect(validateTemplate({ ...base, target: "remote", remote_host: " user@example.test " }).remote_host).toBe("user@example.test");
+  });
+  it("stores model/thinking defaults and natural-language instructions verbatim across restarts", () => {
+    const dir = directory(); const registry = new TemplateRegistry(dir);
+    const guidance = {
+      model: "unlisted-model", thinking: "custom-effort",
+      before_start: "启动前检查依赖。\n确认目录可用。",
+      after_start: "启动后检查会话状态。", special_instructions: "保留中文 😀；不要猜测凭据。",
+    };
+    expect(registry.register({ ...base, ...guidance })).toMatchObject(guidance);
+    const restored = new TemplateRegistry(dir);
+    expect(restored.get(base.name)).toMatchObject(guidance);
+    expect(restored.search(null, null, base.name)[0]).toMatchObject(guidance);
+    expect(templateDefaults(restored.get(base.name))).toMatchObject({ model_id: guidance.model, thinking_level: guidance.thinking });
+    for (const field of ["model", "thinking", "before_start", "after_start", "special_instructions"]) {
+      expect(templateDefaults(restored.get(base.name))).not.toHaveProperty(field);
+    }
+  });
+  it("applies nullable metadata defaults when optional fields are absent", () => {
+    const dir = directory(); writeFileSync(join(dir, "templates.json"), JSON.stringify([base]));
+    expect(new TemplateRegistry(dir).get(base.name)).toMatchObject({
+      model: null, thinking: null, before_start: null, after_start: null, special_instructions: null,
+    });
+    expect(validateTemplate({ ...base, before_start: "", after_start: null })).toMatchObject({ before_start: "", after_start: null });
+  });
+  it.each(["model", "thinking", "before_start", "after_start", "special_instructions"])("validates %s without executing it", field => {
+    for (const value of [123, [], {}, "text\0bad"]) {
+      expect(() => validateTemplate({ ...base, [field]: value })).toThrow(expect.objectContaining({ code: "invalid_template" }));
+    }
+    if (field === "model" || field === "thinking") {
+      for (const value of ["", " \n "]) expect(() => validateTemplate({ ...base, [field]: value })).toThrow();
+    }
+  });
+  it("generates all proxy variables from one port and replaces stale aliases while keeping other env", () => {
+    const env = { KEEP: "keep", http_proxy: "old-http", https_proxy: "old-https", no_proxy: "old-bypass",
+      HTTP_PROXY: "old-upper-http", HTTPS_PROXY: "old-upper-https", NO_PROXY: "old-upper-bypass", ALL_PROXY: "old-all", all_proxy: "old-all-lower" };
+    const proxy = validateTemplate({ ...docker, network_mode: "proxy", proxy_port: 12345, env });
+    expect(proxy.env).toEqual({ KEEP: "keep", http_proxy: "http://host.docker.internal:12345",
+      https_proxy: "http://host.docker.internal:12345", no_proxy: DEFAULT_NO_PROXY });
+    expect(env.http_proxy).toBe("old-http"); // No mutation of caller input.
+    expect(templateDefaults(proxy)).toMatchObject({ host_network: false, env: proxy.env });
+    expect(templateDefaults(proxy)).not.toHaveProperty("network_mode");
+    expect(templateDefaults(proxy)).not.toHaveProperty("proxy_port");
+    const dir = directory(); new TemplateRegistry(dir).register({ ...proxy, name: "proxy-persisted" });
+    expect(new TemplateRegistry(dir).get("proxy-persisted")).toMatchObject({ network_mode: "proxy", proxy_port: 12345, env: proxy.env });
+  });
+  it("maps none/host network mode to explicit session host_network without legacy template fields", () => {
+    const ordinary = validateTemplate(docker); const host = validateTemplate({ ...docker, network_mode: "host" });
+    expect(ordinary).toMatchObject({ network_mode: "none", proxy_port: null });
+    expect(host).not.toHaveProperty("host_network");
+    expect(templateDefaults(ordinary).host_network).toBe(false); expect(templateDefaults(host).host_network).toBe(true);
+  });
+  it.each([0, -1, 65536, 1.5, "8080", false, null, undefined])("rejects invalid/missing proxy port %s", proxy_port => {
+    expect(() => validateTemplate({ ...docker, network_mode: "proxy", proxy_port })).toThrow(expect.objectContaining({ code: "invalid_template" }));
   });
   it.each([
     { ...base, name: "../escape" }, { ...base, harness: "unknown" }, { ...base, extra: true },
@@ -44,7 +97,14 @@ describe("template validation and durable registry", () => {
     { ...docker, mounts: [{ source: "relative", target: "/x" }] },
     { ...docker, login_dirs: [{ source: "/a", target: "/x" }], mounts: [{ source: "/b", target: "/x" }] },
     { ...docker, ports: [{ host_port: 65536, container_port: 80 }] },
-    { ...docker, host_network: true, ports: [{ host_port: 80, container_port: 80 }] },
+    { ...docker, host_network: true }, { ...docker, host_network: false },
+    { ...docker, network_mode: "host", ports: [{ host_port: 80, container_port: 80 }] },
+    { ...docker, network_mode: "host", env: { http_proxy: "http://proxy:12345" } },
+    { ...docker, network_mode: "none", env: { https_proxy: "http://proxy:12345" } },
+    { ...docker, env: { HTTP_PROXY: "http://proxy:12345" } },
+    { ...docker, network_mode: "none", proxy_port: 12345 }, { ...docker, network_mode: "host", proxy_port: 12345 },
+    { ...docker, network_mode: "invalid" }, { ...base, network_mode: "host" },
+    { ...base, network_mode: "proxy", proxy_port: 12345 },
   ])("rejects invalid registration %#", raw => {
     expect(() => validateTemplate(raw)).toThrow(expect.objectContaining({ code: "invalid_template" }));
   });
@@ -63,6 +123,10 @@ describe("template validation and durable registry", () => {
     expect(statSync(join(dir, "templates.json")).mode & 0o777).toBe(0o600);
     restored.delete("buddy");
     expect(() => new TemplateRegistry(dir).get("buddy")).toThrow(expect.objectContaining({ code: "template_not_found" }));
+  });
+  it("rejects old host_network registry records without silently migrating them", () => {
+    const dir = directory(); writeFileSync(join(dir, "templates.json"), JSON.stringify([{ ...docker, host_network: false }]));
+    expect(() => new TemplateRegistry(dir)).toThrow(expect.objectContaining({ code: "storage_error" }));
   });
   it("fails closed on a corrupted registry", () => {
     const dir = directory(); writeFileSync(join(dir, "templates.json"), "not JSON");
@@ -101,7 +165,7 @@ describe("command resolution", () => {
 async function app() {
   const dir = directory(); const path = join(dir, "config.yaml");
   writeFileSync(path, stringify({ schema_version: 2, paths: { state_dir: join(dir, "state") },
-    server: { port: 0 }, default_harness: "codebuddy", harnesses: { codebuddy: { models: [{ id: "fake-model" }] } },
+    server: { port: 0 }, default_harness: "codebuddy",
     launch: { docker_command: fileURLToPath(new URL("./fixtures/mock-docker.mjs", import.meta.url)),
       ssh_command: fileURLToPath(new URL("./fixtures/mock-ssh.mjs", import.meta.url)) },
     timeouts: { startup_timeout_seconds: 5, terminate_grace_seconds: 0.05, remote_cleanup_timeout_seconds: 1 } }));
@@ -135,6 +199,51 @@ describe("template HTTP API and decoupled create_session", () => {
     expect(rejected.status).toBe(400);
     expect(rejected.error.code).toBe("unknown_param");
   });
+  it("returns LLM instructions without running them and rejects template-only fields on sessions", async () => {
+    const api = await app(); const marker = join(api.dir, "must-not-run");
+    const guidance = { model: "fake-model", thinking: "low", before_start: `touch ${marker}`,
+      after_start: `touch ${marker}`, special_instructions: "由调用方 LLM 执行，不是服务端 hook。" };
+    const registered = await api.request("register_template", { template: { ...base, ...guidance } });
+    expect(registered.ok).toBe(true); expect(registered.data.template).toMatchObject(guidance);
+    expect((await api.request("search_template", { name: base.name })).data.templates[0]).toMatchObject(guidance);
+    for (const field of Object.keys(guidance)) {
+      const rejected = await api.request("create_session", { ...launch, cwd: api.dir, model_id: "fake-model", [field]: guidance[field as keyof typeof guidance] });
+      expect(rejected.error.code).toBe("unknown_param");
+    }
+    expect((await api.request("ping")).data.sessions).toBe(0); expect(existsSync(marker)).toBe(false);
+    // A caller explicitly maps defaults; the server does not run either instruction at startup.
+    const created = await api.request("create_session", { ...launch, cwd: api.dir, model_id: guidance.model, thinking_level: guidance.thinking });
+    expect(created.ok, JSON.stringify(created)).toBe(true);
+    expect(created.data.options).toMatchObject({ model_id: guidance.model, thinking_level: guidance.thinking });
+    expect(existsSync(marker)).toBe(false);
+    await api.request("close_session", { session_id: created.data.session_id });
+  });
+  it.each(["local", "remote"].flatMap(target => ["none", "host", "proxy"].map(network_mode => ({ target, network_mode }))))(
+    "expands $target Docker $network_mode mode and delivers generated proxy env to the harness", async ({ target, network_mode }) => {
+      const api = await app(); const envFile = join(api.dir, "proxy-env.json"); const log = join(api.dir, "docker.log");
+      vi.stubEnv("MOCK_DOCKER_LOG", log);
+      for (const key of ["http_proxy", "https_proxy", "no_proxy"]) vi.stubEnv(key, "");
+      const registered = await api.request("register_template", { template: { ...docker, ...launch, cwd: api.dir, target,
+        ...(target === "remote" ? { remote_host: "proxy-execution-host" } : {}), network_mode,
+        ...(network_mode === "proxy" ? { proxy_port: 12345 } : {}), env: { FAKE_HARNESS_PROXY_FILE: envFile, KEEP: "unchanged" } } });
+      expect(registered.ok, JSON.stringify(registered)).toBe(true);
+      const t = (await api.request("search_template", { name: base.name })).data.templates[0];
+      const created = await api.request("create_session", { ...launch, model_id: "fake-model", cwd: t.cwd, runtime: t.runtime,
+        target: t.target, ...(t.target === "remote" ? { remote_host: t.remote_host } : {}), docker_image: t.docker_image,
+        host_network: t.network_mode === "host", env: t.env });
+      expect(created.ok, JSON.stringify(created)).toBe(true);
+      await api.request("close_session", { session_id: created.data.session_id });
+      const received = JSON.parse(readFileSync(envFile, "utf8"));
+      expect(received).toEqual(network_mode === "proxy" ? {
+        http_proxy: "http://host.docker.internal:12345", https_proxy: "http://host.docker.internal:12345", no_proxy: DEFAULT_NO_PROXY,
+      } : { http_proxy: "", https_proxy: "", no_proxy: "" });
+      const entries = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line).argv as string[]);
+      const run = entries.find(argv => argv[0] === "run")!;
+      expect(run.includes("--network")).toBe(network_mode === "host");
+      if (network_mode === "proxy") for (const key of ["http_proxy", "https_proxy", "no_proxy"]) {
+        expect(entries.some(argv => argv[0] === "exec" && argv.includes(`${key}=${t.env[key]}`))).toBe(true);
+      }
+    });
   it("starts a harness from direct launch parameters, reports no template identity, and honors a cwd override", async () => {
     const api = await app();
     const created = await api.request("create_session", { ...launch, cwd: api.dir, model_id: "fake-model" });
