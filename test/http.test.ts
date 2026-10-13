@@ -1,5 +1,6 @@
 import { appendFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createServer as createTcpServer } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -597,6 +598,64 @@ describe("HTTP server contract and session state machine", () => {
     expect(frames.find(frame => frame.method === "session/load")?.params.sessionId).toBe(harnessId);
     expect(frames.find(frame => frame.method === "session/prompt")?.params.sessionId).toBe(harnessId);
   });
+  it.each(["local", "remote"])("preflights a Docker proxy on the %s execution target before the harness", async target => {
+    const docker = fileURLToPath(new URL("./fixtures/mock-docker.mjs", import.meta.url));
+    const ssh = fileURLToPath(new URL("./fixtures/mock-ssh.mjs", import.meta.url));
+    const app = await setup({ launch: { docker_command: docker, ssh_command: ssh },
+      timeouts: { startup_timeout_seconds: 5, request_timeout_seconds: 3, remote_cleanup_timeout_seconds: 2, terminate_grace_seconds: 0.05 } });
+    const listener = createTcpServer(socket => socket.end());
+    await new Promise<void>(resolve => listener.listen(0, "127.0.0.1", resolve));
+    cleanup.push(() => new Promise<void>(resolve => listener.close(() => resolve())));
+    const port = (listener.address() as { port: number }).port;
+    const log = join(app.directory, "docker.jsonl"); vi.stubEnv("MOCK_DOCKER_LOG", log);
+    for (const reuse of [false, true]) {
+      const created = await app.createRaw({ runtime: "docker", target,
+        ...(target === "remote" ? { remote_host: "mock-host" } : {}),
+        ...(reuse ? { docker_image: null, docker_id: "a".repeat(64) } : {}),
+        env: { http_proxy: `http://127.0.0.1:${port}`, https_proxy: `http://127.0.0.1:${port}` } });
+      expect(created.ok, JSON.stringify(created)).toBe(true);
+      await app.request("close_session", { session_id: created.data.session_id });
+    }
+    const commands = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line).argv as string[]);
+    const probes = commands.filter(args => args.includes("proxy-preflight"));
+    expect(probes).toHaveLength(2);
+    for (const probe of probes) {
+      const index = commands.indexOf(probe);
+      expect(commands.slice(0, index).some(args => ["run", "start"].includes(args[0]!))).toBe(true);
+      expect(commands.slice(index + 1).some(args => args.includes(fixture))).toBe(true);
+      expect(probe).not.toContain("--env"); // Credentials stay out of the probe/control process.
+    }
+  });
+
+  it.each(["remove", "keep"])("reports proxy startup failure before ACP and honours %s cleanup", async container_policy => {
+    const docker = fileURLToPath(new URL("./fixtures/mock-docker.mjs", import.meta.url));
+    const app = await setup({ launch: { docker_command: docker },
+      timeouts: { startup_timeout_seconds: 5, request_timeout_seconds: 3, remote_cleanup_timeout_seconds: 2, terminate_grace_seconds: 0.05 } });
+    const listener = createTcpServer();
+    await new Promise<void>(resolve => listener.listen(0, "127.0.0.1", resolve));
+    const port = (listener.address() as { port: number }).port;
+    await new Promise<void>(resolve => listener.close(() => resolve()));
+    const log = join(app.directory, "docker.jsonl"); vi.stubEnv("MOCK_DOCKER_LOG", log);
+    const created = await app.createRaw({ runtime: "docker", container_policy,
+      env: { http_proxy: `http://private-user:private-password@127.0.0.1:${port}` } });
+    expect(created.ok).toBe(false); expect(created.error.code).toBe("proxy_unreachable");
+    expect(created.error.message).toContain("ECONNREFUSED");
+    expect(JSON.stringify(created)).not.toMatch(/private-user|private-password/);
+    const commands = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line).argv as string[]);
+    expect(commands.some(args => args.includes("proxy-preflight"))).toBe(true);
+    expect(commands.some(args => args.includes(fixture))).toBe(false);
+    expect(commands.some(args => args[0] === (container_policy === "remove" ? "rm" : "stop"))).toBe(true);
+    expect(readFileSync(log, "utf8")).not.toMatch(/private-user|private-password/);
+  });
+
+  it("rejects malformed Docker proxy URLs without exposing them or entering authentication", async () => {
+    const docker = fileURLToPath(new URL("./fixtures/mock-docker.mjs", import.meta.url));
+    const app = await setup({ launch: { docker_command: docker } });
+    const created = await app.createRaw({ runtime: "docker", env: { https_proxy: "broken-private-password" } });
+    expect(created.status).toBe(400); expect(created.error.code).toBe("invalid_proxy_configuration");
+    expect(JSON.stringify(created)).not.toContain("private-password");
+  });
+
   it.each([{ target: "local", runtime: "docker" }, { target: "remote", runtime: "direct" }, { target: "remote", runtime: "docker" }])("exercises supervisor launch and cleanup via local shims: $target/$runtime", async launch => {
     const docker = fileURLToPath(new URL("./fixtures/mock-docker.mjs", import.meta.url));
     const ssh = fileURLToPath(new URL("./fixtures/mock-ssh.mjs", import.meta.url));

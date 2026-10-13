@@ -33,6 +33,7 @@ import { BridgeError } from "../logic/errors.js";
 import {
   SUPERVISOR_SPEC_ENV,
   buildTransportTarget,
+  checkContainerProxy,
   cleanupContainer,
   cleanupRemote,
   containerAction,
@@ -235,6 +236,7 @@ async function run(spec: SupervisorSpec): Promise<void> {
     if (context.terminatedSignal) {
       exitCode = exitCodeFor(context, 0);
     } else {
+      await checkContainerProxy(spec, context.prepareAbort.signal);
       spec.argv[0] = await resolveTargetCommand(spec, context.prepareAbort.signal);
       const target = buildTransportTarget(spec);
       const child = spawn(target.argv[0] as string, target.argv.slice(1), {

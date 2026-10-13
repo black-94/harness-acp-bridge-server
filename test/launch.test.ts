@@ -480,6 +480,29 @@ describe("runtime argument builders", () => {
     expect(dockerRunArgs(spec({ dockerImage: "img:1", dockerContainerName: "c" }))).not.toContain("--network");
   });
 
+  it.each(["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"])(
+    "adds the execution host gateway when %s uses the Docker host alias", key => {
+      const env = { [key]: "http://user:password@HOST.DOCKER.INTERNAL:10809" };
+      const args = dockerRunArgs(spec({ dockerImage: "img", dockerContainerName: "c", harnessEnv: env }));
+      expect(args.slice(args.indexOf("--add-host"), args.indexOf("--add-host") + 2))
+        .toEqual(["--add-host", "host.docker.internal:host-gateway"]);
+      expect(args.filter(arg => arg === "--add-host")).toHaveLength(1);
+      expect(args.join(" ")).not.toContain("password");
+      const remote = containerControlArgv(spec({ launchMode: "ssh", sshHost: "remote" }), args);
+      expect(remote[3]).toContain("--add-host host.docker.internal:host-gateway");
+    },
+  );
+
+  it("does not change host networking or unrelated bridge proxy hosts", () => {
+    const base = spec({ dockerImage: "img", dockerContainerName: "c" });
+    expect(dockerRunArgs({ ...base, harnessEnv: { https_proxy: "http://proxy.example:10809" } })).not.toContain("--add-host");
+    expect(dockerRunArgs({ ...base, harnessEnv: { no_proxy: "host.docker.internal", http_proxy: "" } })).not.toContain("--add-host");
+    expect(dockerRunArgs({ ...base, dockerHostNetwork: true })).not.toContain("--add-host");
+    expect(dockerRunArgs({ ...base, harnessEnv: { http_proxy: "http://proxy.example:10809/host.docker.internal" } })).not.toContain("--add-host");
+    expect(dockerRunArgs({ ...base, harnessEnv: { http_proxy: "http://host.docker.internal:10809", https_proxy: "http://host.docker.internal:10809" } })
+      .filter(arg => arg === "--add-host")).toHaveLength(1);
+  });
+
   it("wraps docker control commands in ssh for a remote target", () => {
     expect(containerControlArgv(spec(), ["ps"])).toEqual(["docker", "ps"]);
     expect(containerControlArgv(spec({ launchMode: "ssh", sshHost: "h1" }), ["stop", "-t", "0", "name"])).toEqual([

@@ -18,6 +18,8 @@
  */
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { BridgeError } from "../logic/errors.js";
+import { proxyEndpoints, proxyProbeProgram } from "./proxy.js";
 
 export type CleanupAction = "policy" | "force_remove" | "skip";
 
@@ -175,6 +177,11 @@ export function dockerRunArgs(spec: LaunchSpec): string[] {
     args.push("-p", `${bind}${port.host_port}:${port.container_port}/${port.protocol}`);
   }
   if (spec.dockerHostNetwork) args.push("--network", "host");
+  else if (proxyEndpoints(spec.harnessEnv).some(endpoint => endpoint.host === "host.docker.internal")) {
+    // Linux Engine does not supply Docker Desktop's host alias. Resolve it on the actual
+    // execution host (including SSH targets), never to the bridge daemon's local address.
+    args.push("--add-host", "host.docker.internal:host-gateway");
+  }
   args.push("--entrypoint", "/bin/sh", spec.dockerImage as string, "-c", "while :; do sleep 3600; done");
   return args;
 }
@@ -406,6 +413,38 @@ export async function prepareContainer(spec: LaunchSpec, signal?: AbortSignal): 
   const dockerId = spec.reuseContainer ? spec.dockerId : result.stdout.trim();
   if (!isDockerId(dockerId)) throw new Error("Docker did not return a full container ID");
   return dockerId;
+}
+
+/** Fail before spawning the harness when an explicitly configured Docker proxy is unreachable. */
+export async function checkContainerProxy(spec: LaunchSpec, signal?: AbortSignal): Promise<void> {
+  if (!spec.dockerContainerName) return;
+  const endpoints = proxyEndpoints(spec.harnessEnv);
+  if (!endpoints.length) return;
+  const timeoutMs = Math.max(1, Math.min(5000, spec.startupTimeoutSeconds * 1000));
+  const result = await runControl({
+    argv: containerControlArgv(spec, ["exec", spec.dockerContainerName,
+      ...proxyProbeProgram(endpoints, Math.max(1, timeoutMs - 250))]),
+    env: {}, cwd: null,
+  }, timeoutMs, signal);
+  if (result.aborted) throw new BridgeError("request_aborted", "Docker proxy preflight aborted");
+  if (result.code === 0 && !result.timedOut) return;
+  let reason = result.timedOut ? "DNS/TCP check timed out" : "DNS lookup or TCP connection failed";
+  if (result.code === 127) reason = "proxy preflight requires node or python3 in the container";
+  else {
+    // Do not echo arbitrary command output: it may contain credentials. Only accept a code
+    // from our probe, attached to one of the credential-free endpoints we supplied.
+    try {
+      const failure = JSON.parse(result.stdout.trim());
+      if (endpoints.some(endpoint => endpoint.host === failure?.host && endpoint.port === failure?.port) &&
+          typeof failure.code === "string" && /^[A-Z_0-9]{1,40}$/.test(failure.code)) {
+        reason = `${failure.host}:${failure.port} (${failure.code})`;
+      }
+    } catch { /* Keep the generic error. */ }
+  }
+  const hint = spec.reuseContainer && endpoints.some(endpoint => endpoint.host === "host.docker.internal")
+    ? " Recreate the retained container with --add-host host.docker.internal:host-gateway, or supply a reachable proxy URL."
+    : " Check the proxy hostname, listener and container-to-host access.";
+  throw new BridgeError("proxy_unreachable", `Docker proxy preflight failed: ${reason}.${hint}`);
 }
 
 /** Create the container working directory (inside the container only, best effort). */

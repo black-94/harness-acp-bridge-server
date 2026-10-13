@@ -14,7 +14,7 @@
  * The `exec` passthrough keeps the ACP conversation real: the harness argv is executed with
  * inherited stdio exactly as `docker exec -i` would attach it.
  */
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import process from "node:process";
 
@@ -75,8 +75,23 @@ if (command === "exec") {
     }
     break;
   }
-  rest.shift(); // container name
+  const container = rest.shift();
   const [program, ...programArgs] = rest;
+  // Model Docker's host-gateway mapping for a real local TCP probe. Only a container whose
+  // recorded `run` actually requested --add-host gets the alias; missing wiring still fails.
+  const marker = programArgs.indexOf("proxy-preflight");
+  if (marker >= 0 && process.env.MOCK_DOCKER_HOST_GATEWAY && process.env.MOCK_DOCKER_LOG) {
+    const entries = readFileSync(process.env.MOCK_DOCKER_LOG, "utf8").trim().split("\n").map(line => JSON.parse(line).argv);
+    const run = entries.find(args => args[0] === "run" && args.includes(container));
+    if (run?.includes("host.docker.internal:host-gateway")) {
+      const index = marker + 3;
+      const endpoints = JSON.parse(programArgs[index]);
+      for (const endpoint of endpoints) {
+        if (endpoint.host === "host.docker.internal") endpoint.host = process.env.MOCK_DOCKER_HOST_GATEWAY;
+      }
+      programArgs[index] = JSON.stringify(endpoints);
+    }
+  }
   const child = spawn(program, programArgs, { stdio: "inherit", env, cwd });
   child.on("exit", (code, signal) => process.exit(signal ? 1 : (code ?? 0)));
   child.on("error", (error) => {

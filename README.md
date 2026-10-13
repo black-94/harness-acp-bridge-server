@@ -230,10 +230,25 @@ See [`templates/docker-host.json`](templates/docker-host.json) and
 [`templates/docker-proxy.json`](templates/docker-proxy.json). Their images/paths and the example
 proxy port must be confirmed and replaced before registration. The fixed host address must be
 reachable from the execution host's container network (the remote machine for SSH/Docker).
-Container localhost is not the host. Linux may need host-gateway configuration; the bridge does not
-silently alter Docker, proxy listeners or firewalls. The HTTP client must support the generated
-proxy settings/CIDR bypasses; env delivery alone is not proof of connectivity. This config is not
-for Docker daemon/image pulls or the Pi/MCP bridge client.
+Container localhost is not the host. For a **new bridge container** whose proxy URL uses
+`host.docker.internal`, the server adds `--add-host host.docker.internal:host-gateway` (Docker Engine
+20.10+), on the actual execution host, including SSH targets. It does not modify proxy listeners,
+host DNS, routing or firewalls. Reused containers are not rewritten: their existing network must
+already resolve and reach the proxy; recreate an older Linux container with the host-gateway mapping
+if needed.
+
+Before starting a Docker harness with explicit active HTTP/HTTPS/ALL_PROXY env values, the server
+runs a credential-free DNS/TCP check **inside the container**, bounded by the startup timeout and
+at most five seconds. The image must provide `node` or `python3`. An invalid proxy URL returns
+`invalid_proxy_configuration`; an unresolvable/unreachable proxy (or a missing probe runtime) returns
+`proxy_unreachable`, before authentication begins. No proxy credentials or external login requests
+are sent by this check. The normal container cleanup policy still applies on failure.
+
+This check only proves access to the proxy listener, not proxy authentication, CONNECT/TLS to a
+remote site, or successful login. The HTTP client must support the generated proxy settings/CIDR
+bypasses. For example, a proxy's upstream DNS may fail even while the listener is reachable, and
+host-only transparent proxy routing may not cover Docker bridge traffic. This config is not for
+Docker daemon/image pulls or the Pi/MCP bridge client.
 
 **No legacy template compatibility:** template `host_network` is rejected. Re-register old templates
 using `network_mode`/`proxy_port`; an old on-disk registry containing removed fields must be replaced

@@ -1,5 +1,6 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createServer as createTcpServer } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -230,10 +231,18 @@ describe("template HTTP API and decoupled create_session", () => {
     "expands $target Docker $network_mode mode and delivers generated proxy env to the harness", async ({ target, network_mode }) => {
       const api = await app(); const envFile = join(api.dir, "proxy-env.json"); const log = join(api.dir, "docker.log");
       vi.stubEnv("MOCK_DOCKER_LOG", log);
+      let proxyPort = 12345;
+      if (network_mode === "proxy") {
+        const listener = createTcpServer(socket => socket.end());
+        await new Promise<void>(resolve => listener.listen(0, "127.0.0.1", resolve));
+        cleanup.push(() => new Promise<void>(resolve => listener.close(() => resolve())));
+        proxyPort = (listener.address() as { port: number }).port;
+        vi.stubEnv("MOCK_DOCKER_HOST_GATEWAY", "127.0.0.1");
+      }
       for (const key of ["http_proxy", "https_proxy", "no_proxy"]) vi.stubEnv(key, "");
       const registered = await api.request("register_template", { template: { ...docker, ...launch, cwd: api.dir, target,
         ...(target === "remote" ? { remote_host: "proxy-execution-host" } : {}), network_mode,
-        ...(network_mode === "proxy" ? { proxy_port: 12345 } : {}), env: { FAKE_HARNESS_PROXY_FILE: envFile, KEEP: "unchanged" } } });
+        ...(network_mode === "proxy" ? { proxy_port: proxyPort } : {}), env: { FAKE_HARNESS_PROXY_FILE: envFile, KEEP: "unchanged" } } });
       expect(registered.ok, JSON.stringify(registered)).toBe(true);
       const t = (await api.request("search_template", { name: base.name })).data.templates[0];
       const created = await api.request("create_session", { ...launch, model_id: "fake-model", cwd: t.cwd, runtime: t.runtime,
@@ -243,11 +252,13 @@ describe("template HTTP API and decoupled create_session", () => {
       await api.request("close_session", { session_id: created.data.session_id });
       const received = JSON.parse(readFileSync(envFile, "utf8"));
       expect(received).toEqual(network_mode === "proxy" ? {
-        http_proxy: "http://host.docker.internal:12345", https_proxy: "http://host.docker.internal:12345", no_proxy: DEFAULT_NO_PROXY,
+        http_proxy: `http://host.docker.internal:${proxyPort}`, https_proxy: `http://host.docker.internal:${proxyPort}`, no_proxy: DEFAULT_NO_PROXY,
       } : { http_proxy: "", https_proxy: "", no_proxy: "" });
       const entries = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line).argv as string[]);
       const run = entries.find(argv => argv[0] === "run")!;
       expect(run.includes("--network")).toBe(network_mode === "host");
+      expect(run.includes("host.docker.internal:host-gateway")).toBe(network_mode === "proxy");
+      expect(entries.some(argv => argv.includes("proxy-preflight"))).toBe(network_mode === "proxy");
       if (network_mode === "proxy") for (const key of ["http_proxy", "https_proxy", "no_proxy"]) {
         expect(entries.some(argv => argv[0] === "exec" && argv.includes(`${key}=${t.env[key]}`))).toBe(true);
       }
