@@ -67,6 +67,17 @@ async function waitAuth(request: (method: string, params?: Record<string, unknow
   }
   throw new Error(`auth never satisfied predicate: ${JSON.stringify(snapshot)}`);
 }
+/** Wait until a message exposes an interactive reverse request. */
+async function waitMessageQuestion(request: (method: string, params?: Record<string, unknown>) => Promise<any>, session: string, message: string) {
+  const end = Date.now() + 4000;
+  while (Date.now() < end) {
+    const status = (await request("message_status", { session_id: session, message_id: message })).data;
+    if (status?.questions?.length) return status;
+    if (status?.terminal) throw new Error(`message finished without a question: ${JSON.stringify(status)}`);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error("no message question arrived");
+}
 /** The method-selection question of a flow snapshot. */
 const methodQuestion = (snapshot: any) => (snapshot.questions ?? []).find((question: any) => question.schema?.properties?.method_id);
 /** Wait for the next non-selection auth question (a token/browser reverse request). */
@@ -187,8 +198,10 @@ describe("HTTP server contract and session state machine", () => {
     const raw = readFileSync(join(app.config.paths.sessionDir, session, "raw.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(raw.filter(event => event.stream === "stdout").some(event => Buffer.from(event.raw, "base64").toString("utf8").startsWith("\ufeff\x1b[32m"))).toBe(true);
   });
-  it("validates permission options and routes the original request id", async () => {
-    const app = await setup(); const session = await app.create();
+  it.each(["read", "edit", "auto"])("validates permission options and routes the original request id in %s mode", async mode => {
+    const app = await setup(); const created = await app.createRaw({ permission_mode: mode });
+    expect(created.ok, JSON.stringify(created)).toBe(true);
+    const session = created.data.session_id;
     const message = (await app.request("send_message", { session_id: session, text: "permission" })).data.message_id;
     let status: any;
     for (let index = 0; index < 50; index++) {
@@ -215,6 +228,55 @@ describe("HTTP server contract and session state machine", () => {
     expect(question).toBeDefined();
     const answer = await app.request("answer_question", { session_id: session, message_id: message, request_id: question.request_id, content: { value: "回答😀" } });
     expect(answer.ok).toBe(true); expect((await app.complete(session, message)).result.text).toContain("回答😀");
+  });
+  it.each(["codebuddy", "codex", "agy"])("automatically selects the first permission option in yolo mode for %s", async harness => {
+    const app = await setup({}, [], harness);
+    const created = await app.createRaw({ permission_mode: "yolo" });
+    expect(created.ok, JSON.stringify(created)).toBe(true);
+    const session = created.data.session_id;
+    for (const [text, expected] of [["permission", "allowed:allow_once"], ["permission-reject-first", "denied:deny_once"]]) {
+      const message = (await app.request("send_message", { session_id: session, text })).data.message_id;
+      const status = await app.complete(session, message);
+      expect(status.state).toBe("completed");
+      expect(status.questions).toEqual([]);
+      expect(status.result.text).toContain(`[${expected}]`);
+      expect(status.activity.observed_phase).not.toBe("waiting_input");
+    }
+    const raw = readFileSync(join(app.config.paths.sessionDir, session, "raw.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(raw.filter(event => event.event === "question_pending")).toHaveLength(0);
+    expect(raw.filter(event => event.event === "question_auto_answered")).toHaveLength(2);
+  });
+  it("uses the current permission mode after live option changes", async () => {
+    const app = await setup(); const session = await app.create();
+    expect((await app.request("set_session_options", { session_id: session, permission_mode: "yolo" })).ok).toBe(true);
+    const first = (await app.request("send_message", { session_id: session, text: "permission" })).data.message_id;
+    expect((await app.complete(session, first)).result.text).toContain("[allowed:allow_once]");
+    expect((await app.request("set_session_options", { session_id: session, permission_mode: "auto" })).ok).toBe(true);
+    const second = (await app.request("send_message", { session_id: session, text: "permission" })).data.message_id;
+    const status = await waitMessageQuestion(app.request, session, second);
+    expect(status.state).toBe("waiting_input");
+    await app.request("answer_question", { session_id: session, message_id: second, request_id: status.questions[0].request_id, option_id: "deny_once" });
+    expect((await app.complete(session, second)).result.text).toContain("[denied:deny_once]");
+  });
+  it.each(["info", "elicit-form"])("keeps %s questions interactive in yolo mode", async text => {
+    const app = await setup(); const created = await app.createRaw({ permission_mode: "yolo" });
+    expect(created.ok, JSON.stringify(created)).toBe(true);
+    const session = created.data.session_id;
+    const message = (await app.request("send_message", { session_id: session, text })).data.message_id;
+    const status = await waitMessageQuestion(app.request, session, message);
+    expect(status.state).toBe("waiting_input");
+    expect(status.questions[0].kind).toBe(text === "info" ? "information" : "elicitation");
+    await app.request("cancel_message", { session_id: session, message_id: message });
+  });
+  it.each(["permission-no-options", "permission-invalid-first"])("does not invent an option for %s in yolo mode", async text => {
+    const app = await setup(); const created = await app.createRaw({ permission_mode: "yolo" });
+    expect(created.ok, JSON.stringify(created)).toBe(true);
+    const session = created.data.session_id;
+    const message = (await app.request("send_message", { session_id: session, text })).data.message_id;
+    const status = await waitMessageQuestion(app.request, session, message);
+    expect(status.state).toBe("waiting_input");
+    expect(status.questions[0].kind).toBe("permission");
+    await app.request("cancel_message", { session_id: session, message_id: message });
   });
   it.each(["codebuddy", "codex", "agy"])("routes session model/thinking/permission options for %s", async harness => {
     const app = await setup({}, ["--live-thinking-options"], harness); const session = await app.create();
@@ -388,6 +450,18 @@ describe("HTTP server contract and session state machine", () => {
     // Acknowledging the browser step is not the login; the harness has not confirmed yet.
     expect(acked.data.state).toBe("authenticating");
     expect(acked.data.terminal).toBe(false);
+    expect((await waitAuth(app.request, session, snapshot => snapshot.state === "ready")).authenticated).toBe(true);
+  });
+  it("auto-answers auth permissions in yolo mode but still asks for login information", async () => {
+    const app = await setup({ timeouts: AUTH_TIMEOUTS }, ["--auth-methods"]);
+    const created = await app.createRaw({ permission_mode: "yolo" });
+    const session = created.error.detail.session_id as string;
+    const started = await app.request("authenticate", { session_id: session });
+    await app.request("answer_question", { session_id: session, request_id: methodQuestion(started.data).request_id, content: { method_id: "approve" } });
+    const question = await nextAuthQuestion(app.request, session);
+    expect(question.kind).toBe("information");
+    expect(question.title).toBe("Choose account");
+    await app.request("answer_question", { session_id: session, request_id: question.request_id, content: { account: "test" } });
     expect((await waitAuth(app.request, session, snapshot => snapshot.state === "ready")).authenticated).toBe(true);
   });
   it("runs a permission-then-information auth loop, answering the permission with an option and no content", async () => {

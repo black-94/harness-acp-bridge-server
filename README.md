@@ -150,7 +150,11 @@ untrusted callers.
   image, mounts, ports, and network, so supplying them is rejected rather than silently ignored.
 
 Permission modes are `read`, `edit`, `auto`, `yolo`. Adapters determine whether a particular
-harness supports changing a mode live. Model IDs and thinking levels are supplied explicitly
+harness supports changing a mode live. In `yolo` mode, the server also intercepts reverse
+`session/request_permission` requests (including during authentication) and automatically selects
+the first offered option, in harness order, without exposing a pending client question. Empty
+options or a first option without a valid `optionId` fall back to the normal question flow.
+Information and elicitation requests remain interactive. Model IDs and thinking levels are supplied explicitly
 (or mapped from template defaults) and validated against live ACP options when advertised,
 otherwise by the harness request itself; no YAML candidate lists constrain them.
 

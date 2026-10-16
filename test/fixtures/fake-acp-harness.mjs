@@ -282,6 +282,13 @@ function startPrompt(id, text) {
   if (text.includes("permission")) {
     const requestId = permissionRequestId++;
     pendingPermission = { requestId, promptId: id };
+    const options = [
+      { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+      { optionId: "deny_once", name: "Deny", kind: "reject_once" },
+    ];
+    if (text.includes("reject-first")) options.reverse();
+    if (text.includes("no-options")) options.length = 0;
+    if (text.includes("invalid-first")) delete options[0].optionId;
     send({
       jsonrpc: "2.0",
       id: requestId,
@@ -289,10 +296,7 @@ function startPrompt(id, text) {
       params: {
         sessionId,
         message: "Allow this action?",
-        options: [
-          { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
-          { optionId: "deny_once", name: "Deny", kind: "reject_once" },
-        ],
+        options,
         toolCall: {
           toolCallId: "tool-1",
           title: "do a thing",

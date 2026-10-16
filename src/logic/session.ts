@@ -483,6 +483,14 @@ export class HarnessSession {
   }
   private onQuestion(question: Question): void {
     this.lastProgressAt = Date.now();
+    const firstOptionId = question.options[0]?.optionId;
+    // YOLO is enforced at the bridge too: some harnesses still ask despite their launch mode.
+    // Preserve offered order (not option kind), and leave malformed/empty options to normal input.
+    if (this.permissionMode === "yolo" && question.kind === "permission" && typeof firstOptionId === "string" && firstOptionId.length > 0) {
+      this.journal("question_auto_answered", { request_id: question.request_id, option_id: firstOptionId, permission_mode: this.permissionMode });
+      void this.protocol.answer(question, "accept", firstOptionId, null).catch(error => this.onFault(error));
+      return;
+    }
     this.observedPhase = "waiting_input";
     if (this.authQuestionSink) {
       const interaction = this.adapter.normalizeAuthQuestion(question);
